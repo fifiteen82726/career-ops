@@ -14,7 +14,9 @@
 
 **Files:**
 - Create: `config/local-paths.txt`
-- Modify: `.gitignore`
+- Modify: `.git/info/exclude`
+- Create: `data/cache/upgrade/pre-1.32-user-sha256.tsv`
+- Create outside repo: `/Users/coda/Documents/ChatGPT/career-ops-upgrade-backup-2026-09-07.tgz`
 - Inspect: `cv.md`, `config/profile.yml`, `modes/_profile.md`, `modes/_custom.md`, `portals.yml`, `data/`, `profiles/`, `outputs/`
 
 - [ ] **Step 1: Record repository and version state**
@@ -39,11 +41,11 @@ profiles/
 outputs/
 ```
 
-Add `/profiles/` and `/outputs/` to `.gitignore`. Do not add provider or test paths because they overlap the system layer and must be merged rather than hidden from updates.
+Add `/profiles/` and `/outputs/` to `.git/info/exclude`. Do not modify tracked `.gitignore` before the upgrade. Do not add provider or test paths to `config/local-paths.txt` because they overlap the system layer and must be merged rather than hidden from updates.
 
-- [ ] **Step 3: Save a non-private system customization patch**
+- [ ] **Step 3: Save a concrete backup of untracked custom code**
 
-Record the diffs for:
+Create `/Users/coda/Documents/ChatGPT/career-ops-upgrade-backup-2026-09-07.tgz` containing:
 
 ```text
 providers/ashby.mjs
@@ -59,7 +61,11 @@ data/tools/
 
 Do not include `cv.md`, profile data, DOL cache rows, scan history, reports, Sheet payloads, or credentials in a commit or public patch.
 
-- [ ] **Step 4: Run the current focused baseline tests**
+- [ ] **Step 4: Write the immutable user-file checksum manifest**
+
+Write tab-separated SHA-256 hashes for `cv.md`, `config/profile.yml`, `modes/_profile.md`, and `modes/_custom.md` into `data/cache/upgrade/pre-1.32-user-sha256.tsv`. Record `portals.yml` separately as the mutable pre-expansion baseline. The post-upgrade check must compare these four immutable files byte-for-byte before any company write.
+
+- [ ] **Step 5: Run the current focused baseline tests**
 
 Run:
 
@@ -85,10 +91,11 @@ Expected: all focused tests pass before the upgrade.
 Run:
 
 ```bash
-node update-system.mjs apply --confirm
+git ls-remote https://github.com/career-ops-hq/career-ops.git refs/heads/main
+node update-system.mjs apply
 ```
 
-Expected: the updater creates a backup branch/WIP ref, updates non-overlapping system paths, and reports local system files it preserved. Do not rerun with `--force`.
+Expected: record the canonical main SHA first. The updater creates a backup branch/WIP ref, updates non-overlapping system paths, and reports local system files it preserved. Do not rerun with `--force`. The updater follows canonical `main`; the recorded SHA makes the exact target auditable even when `VERSION` remains 1.32.0.
 
 - [ ] **Step 2: Confirm the installed release and protected data**
 
@@ -99,7 +106,7 @@ node update-system.mjs check
 git status --short
 ```
 
-Expected: version 1.32.0 or current main with 1.32.0 as its release baseline; Sunny user files remain present. If `check` reports system drift only for intentionally preserved files, continue to Task 3.
+Expected: version 1.32.0, with the installed commit traceable to the recorded main SHA. Recompute the four immutable hashes from Task 1 and require exact equality. If `check` reports system drift only for intentionally preserved files, continue to Task 3.
 
 ### Task 3: Integrate the local ATS fixes with 1.32
 
@@ -117,7 +124,7 @@ Use the 1.32 `providers/workday.mjs` as the base. Confirm it retains facet-split
 
 - [ ] **Step 2: Write/retain the failing local URL-shape test**
 
-The test must assert that:
+The tests must assert that:
 
 ```js
 workday.detect({
@@ -132,6 +139,8 @@ resolves to:
 https://wd3.myworkdaysite.com/wday/cxs/brevanhoward/BH_ExternalCareers/jobs
 ```
 
+It must also prove that a direct modern CXS URL resolves without corrupting the tenant/site, that returned job URLs use `/recruiting/brevanhoward/BH_ExternalCareers`, and that `workdayDedupKey()` collapses the same requisition across two sites on both `.myworkdayjobs.com` and `.myworkdaysite.com` hosts.
+
 Run it against the untouched upstream provider and verify that this local behavior fails before implementation.
 
 - [ ] **Step 3: Reapply the minimal Workday URL support**
@@ -142,7 +151,7 @@ Extend the upstream endpoint resolver to accept only this anchored HTTPS shape:
 https://wd*.myworkdaysite.com/recruiting/{tenant}/{site}
 ```
 
-Construct the CXS endpoint on the same host and the job base under `/recruiting/{tenant}/{site}`. Preserve the upstream CXS URL and legacy `myworkdayjobs.com` branches and their SSRF guards.
+Construct the CXS endpoint on the same host and the job base under `/recruiting/{tenant}/{site}`. Extend the upstream direct-CXS and dedup host validation to the allowlisted `.myworkdaysite.com` shape without weakening its anchored HTTPS/host checks. Preserve the upstream legacy `myworkdayjobs.com` branches, facet splitting, partial markers, and SSRF guards.
 
 - [ ] **Step 4: Verify Ashby and MobiCloud extensions**
 
@@ -157,10 +166,10 @@ node tests/providers/workday.test.mjs
 node tests/providers/ashby-page-fallback.test.mjs
 node tests/providers/ashby.test.mjs
 node tests/providers/mcloud.test.mjs
-node verify-portals.mjs --summary
+node validate-portals.mjs
 ```
 
-Expected: all focused tests pass; portal verification reports no configuration errors.
+Expected: all focused tests pass; portal validation reports no configuration errors.
 
 ### Task 4: Verify the complete upgraded pipeline
 
@@ -191,9 +200,9 @@ python3 tests/test_sunny_ny_metro_h1b.py
 
 Expected: broad title discovery, hard exclusions, NYC Metro geography, identity resolution, and dedup all pass.
 
-- [ ] **Step 3: Smoke-test representative boards**
+- [ ] **Step 3: Smoke-test representative boards and separate health evidence**
 
-Run bounded scans against one Greenhouse board, one Ashby hosted-page-fallback board, one legacy Workday board, one `myworkdaysite.com` board, and MobiCloud. Confirm the scan receipt distinguishes success, empty, error, dead, and partial states.
+Run bounded scans against one Greenhouse board, one Ashby hosted-page-fallback board, one legacy Workday board, one `myworkdaysite.com` board, and MobiCloud. Save the `careerops.scan.receipt@1` JSON and validate only its documented counters, `added_urls`, `errors`, and `dry_run` fields. Separately run `node verify-portals.mjs --strict` against a scratch portals file and save its log for live, live-empty, missing/dead, partial, and transient-error interpretation. A transient failure is retried once and remains an error if the retry fails; it is never rewritten as empty.
 
 ### Task 5: Enable and inspect the new expansion sources
 
@@ -202,6 +211,10 @@ Run bounded scans against one Greenhouse board, one Ashby hosted-page-fallback b
 - Modify: `portals.yml` only after verified preview
 - Generate: `data/cache/dol/sunny-builtin-company-leads-2026-09-07.tsv`
 - Generate: `data/cache/dol/sunny-expansion-candidates-2026-09-07.yml`
+- Create: `data/tools/collect-sunny-builtin-leads.mjs`
+- Create: `data/tools/join-sunny-builtin-h1b.mjs`
+- Create: `tests/sunny-builtin-leads.test.mjs`
+- Create: `tests/sunny-builtin-h1b-join.test.mjs`
 
 - [ ] **Step 1: Inspect installed 1.32 source interfaces**
 
@@ -209,23 +222,43 @@ Run:
 
 ```bash
 node plugins.mjs list
-node providers/builtin.mjs --help
 node scan.mjs --help
 ```
 
-If the Built In provider has no direct CLI, configure the documented `job_boards` entry in a scratch portals file and run `scan.mjs` against it.
+Confirm `providers/builtin.mjs` is a library provider with no CLI and inspect its exported `fetch()` contract. Do not treat `node providers/builtin.mjs --help` as a supported command.
 
 - [ ] **Step 2: Enable the H-1B sponsor plugin if locally available**
 
-Use `node plugins.mjs skill h1b-sponsor` to read its hook contract, then install/enable it through `plugins.mjs`. Do not allow it to overwrite the FY2026 Q3 DOL universe; persist its output as supplemental evidence only.
+Use `node plugins.mjs skill h1b-sponsor` to read its hook contract, then run exactly:
 
-- [ ] **Step 3: Collect Built In employer leads**
+```bash
+node plugins.mjs enable h1b-sponsor --confirm
+node plugins/h1b-sponsor/install-h1b-index.mjs
+```
 
-Run broad New York Metropolitan and US-remote searches for the existing Sunny title families. Deduplicate employer brands and write a TSV containing source URL, company brand, title, location, publication date, and first-seen date.
+The user's reviewed-plan authorization covers the approximately 8 MiB public index download. Do not use the plugin as a batch company-admission gate or include its results in added-company counts. It remains supplemental evidence for individual company evaluations; the FY2026 Q3 `CHANGE_EMPLOYER` table remains authoritative.
 
-- [ ] **Step 4: Join every lead to H-1B evidence**
+- [ ] **Step 3: Test and implement the Built In collector**
 
-Normalize the Built In brand against the DOL legal name, DBA, and reviewed parent/alias map. Emit only matched/reviewable companies to `sunny-expansion-candidates-2026-09-07.yml`; aggregator-only brands remain leads and are not added.
+Create `collect-sunny-builtin-leads.mjs`, importing the Built In provider and `makeHttpCtx()`. Export `collectBuiltinLeads({hosts, queries, maxPages, fetchProvider, now})` and `dedupeBuiltinLeads(jobs)`. Configure `www.builtinnyc.com` and `builtin.com` with these explicit queries: `data engineer`, `analytics engineer`, `business intelligence engineer`, `data analyst`, `financial data analyst`, `data platform`, `data warehouse`, `ETL`, and `ELT`; use `scope: remote` on the national host. The TSV columns are `company`, `title`, `location`, `posted_at`, `url`, `source_host`, and `first_seen`. Tests must prove cross-query URL deduplication, company preservation, UTC date serialization, and rejection of rows with no company or URL.
+
+Run:
+
+```bash
+node tests/sunny-builtin-leads.test.mjs
+node data/tools/collect-sunny-builtin-leads.mjs --output data/cache/dol/sunny-builtin-company-leads-2026-09-07.tsv
+```
+
+- [ ] **Step 4: Test and implement the DOL/alias join**
+
+Create `join-sunny-builtin-h1b.mjs`, exporting `joinBuiltinCompanies({leads, employers, reviews})`. Exact canonical legal-name/DBA equality is accepted. A non-exact brand is accepted only when `sunny-h1b-ats-identity-reviews.yml` contains an `accept` mapping for that identity and URL/domain evidence. Prefix and substring matches are never accepted. Tests must include Mercury versus Mercury Systems, Scale versus Scale AI, an accepted DBA, an ambiguous normalized collision, and an aggregator-only company. Emit accepted and needs-review sections separately; only accepted entries go into `sunny-expansion-candidates-2026-09-07.yml`.
+
+Run:
+
+```bash
+node tests/sunny-builtin-h1b-join.test.mjs
+node data/tools/join-sunny-builtin-h1b.mjs --leads data/cache/dol/sunny-builtin-company-leads-2026-09-07.tsv --output data/cache/dol/sunny-expansion-candidates-2026-09-07.yml
+```
 
 ### Task 6: Replay all deterministic ATS discovery
 
@@ -233,6 +266,11 @@ Normalize the Built In brand against the DOL legal name, DBA, and reviewed paren
 - Regenerate: `profiles/sunny-ny-metro-h1b-seeds.yml`
 - Update: `data/cache/dol/sunny-ny-metro-resolution-2026-09-02.tsv`
 - Update: `data/cache/dol/sunny-ny-metro-discovery.jsonl`
+- Create: `data/cache/dol/sunny-ny-metro-discovery-v2-2026-09-07.jsonl`
+- Create: `data/tools/sunny-ats-identity-gate.mjs`
+- Create: `tests/sunny-ats-identity-gate.test.mjs`
+- Modify: `data/tools/run-sunny-ny-metro-discovery.mjs`
+- Modify: `data/tools/build-sunny-ny-metro-resolution.mjs`
 - Modify: `portals.yml`
 
 - [ ] **Step 1: Rebuild the current resolution baseline**
@@ -245,40 +283,56 @@ node data/tools/build-sunny-ny-metro-resolution.mjs
 
 Record exact already-covered, unresolved, ambiguous, invalid, excluded, and error counts before adding companies.
 
-- [ ] **Step 2: Run the checkpointed unresolved-company resolver**
+- [ ] **Step 2: Implement the ownership and durable-state gate**
+
+Create `sunny-ats-identity-gate.mjs`, exporting `canonicalIdentityTokens()`, `classifyPublishedOwner()`, `reviewedUrlVerdict()`, and `classifyDiscoveryCandidate()`. Reuse the strict equality semantics of `verify-portals.mjs`'s `boardIdentityMatches`: legal suffixes may be removed, but prefixes/substrings never match. Greenhouse/Ashby/Lever require a fetched published owner. All other providers require an exact accepted `identity + careers_url` review or an official-site link recorded in the reviews file. Return one of the v2 statuses in the design; never return a writable state on timeout, missing owner, prefix match, or guessed long-tail slug.
+
+Update `run-sunny-ny-metro-discovery.mjs` so `--write` accepts only `owner_verified` and `reviewed_official_link`. Add `schemaVersion: 2`, `runId`, `provider`, `careersUrl`, `boardOwner`, `evidence`, and `status` to every checkpoint record. Add `--retry-statuses unresolved,error,owner_unreachable,partial` and ensure only those statuses are requeued. Update `build-sunny-ny-metro-resolution.mjs` to consume the v2 checkpoint and preserve every terminal state in the final TSV.
+
+Tests must prove Mercury/Mercury Systems and Scale/Scale AI fail closed, an exact owner passes, a reviewed Workday URL passes, a guessed Workable slug remains review-required, old unresolved/error records can be replayed, accepted records are not replayed, malformed checkpoint tails are ignored, and only the two writable statuses reach `portals.yml`.
+
+Run:
+
+```bash
+node tests/sunny-ats-identity-gate.test.mjs
+node tests/sunny-ny-metro-discovery.test.mjs
+node tests/sunny-ny-metro-resolution.test.mjs
+```
+
+- [ ] **Step 3: Run the checkpointed unresolved-company resolver**
 
 Run the full unresolved set with bounded concurrency and resume support:
 
 ```bash
-node data/tools/run-sunny-ny-metro-discovery.mjs --batch-size 50 --concurrency 8
+node data/tools/run-sunny-ny-metro-discovery.mjs --checkpoint data/cache/dol/sunny-ny-metro-discovery-v2-2026-09-07.jsonl --batch-size 50 --concurrency 8
 ```
 
 Preview resolved entries, verify their DOL identity and live board, then use the already-authorized write path:
 
 ```bash
-node data/tools/run-sunny-ny-metro-discovery.mjs --batch-size 50 --concurrency 8 --write
+node data/tools/run-sunny-ny-metro-discovery.mjs --checkpoint data/cache/dol/sunny-ny-metro-discovery-v2-2026-09-07.jsonl --batch-size 50 --concurrency 8 --write
 ```
 
-Continue from the JSONL checkpoint until no pending companies remain. Do not restart completed identities.
+The new checkpoint intentionally replays the 34 unresolved records in the old checkpoint. Continue until no first-pass pending companies remain. Retry only `unresolved,error,owner_unreachable,partial` explicitly; never restart accepted identities.
 
-- [ ] **Step 3: Resolve Built In candidates**
+- [ ] **Step 4: Resolve Built In candidates through the same ownership gate**
 
 Run:
 
 ```bash
-node discover-ats.mjs --in data/cache/dol/sunny-expansion-candidates-2026-09-07.yml --summary
-node discover-ats.mjs --in data/cache/dol/sunny-expansion-candidates-2026-09-07.yml --write
+node data/tools/run-sunny-ny-metro-discovery.mjs --in data/cache/dol/sunny-expansion-candidates-2026-09-07.yml --checkpoint data/cache/dol/sunny-builtin-ats-discovery-v2-2026-09-07.jsonl --batch-size 50 --concurrency 8
+node data/tools/run-sunny-ny-metro-discovery.mjs --in data/cache/dol/sunny-expansion-candidates-2026-09-07.yml --checkpoint data/cache/dol/sunny-builtin-ats-discovery-v2-2026-09-07.jsonl --batch-size 50 --concurrency 8 --write
 ```
 
-The user has pre-authorized the reviewed plan's writes. Still inspect the preview and withhold ambiguous identity matches before executing `--write`.
+The same code-enforced ownership gate applies before `--write`; inspection cannot substitute for the gate. The user has pre-authorized the reviewed plan's verified writes.
 
-- [ ] **Step 4: Resolve Workday and unsupported-site gaps**
+- [ ] **Step 5: Resolve Workday and unsupported-site gaps**
 
 For unresolved high-volume Metro identities, obtain official careers URLs, extract Workday tenant/site coordinates when present, and rerun `discover-ats.mjs --vendors workday`. For supported non-slug providers, add only first-party URLs. Record custom/unsupported careers pages as durable handoff states rather than fabricating an ATS.
 
-- [ ] **Step 5: Prove idempotency**
+- [ ] **Step 6: Prove idempotency**
 
-Repeat both write commands. Expected: `freshWritten: 0` and no change to `portals.yml`.
+Repeat both ownership-gated write commands. Expected: `added: 0` and no change to `portals.yml`.
 
 ### Task 7: Final coverage audit and operational handoff
 
@@ -294,10 +348,10 @@ Run:
 ```bash
 node data/tools/build-sunny-ny-metro-resolution.mjs
 node validate-portals.mjs
-node verify-portals.mjs --summary
+node verify-portals.mjs --strict
 ```
 
-Record final portal-entry, linked-identity, unresolved, ambiguous, live-empty, dead, error, and partial counts.
+Save the verification output as the portal-health artifact. If strict mode exits non-zero, separate definitive missing/dead boards from transient errors, retry only transient errors once, and report the remaining states instead of claiming a clean reachability sweep. Record final portal-entry, linked-identity, unresolved, ambiguous, live-empty, dead, error, and partial counts from the v2 resolution plus portal-health evidence.
 
 - [ ] **Step 2: Run a bounded three-day production-like scan**
 

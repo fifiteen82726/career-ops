@@ -25,7 +25,7 @@ Upgrade Sunny's career-ops fork from 1.29.0 to the 1.32.0 system layer without l
 
 ## Upgrade Architecture
 
-The upgrade uses the repository's system updater in preserve mode. Before applying it, custom untracked assets are inventoried and fork-only user directories are declared in `config/local-paths.txt`. The updater's backup branch/WIP ref is supplemented by a patch or commit containing only system-code customizations; private user-layer files are never committed.
+The upgrade uses the repository's system updater in preserve mode. Before applying it, custom untracked code is copied into a dated archive outside the repository, immutable user files receive a SHA-256 manifest in `data/cache/upgrade/`, and fork-only user directories are declared in `config/local-paths.txt`. Clone-only privacy ignores go in `.git/info/exclude` so the pre-upgrade step does not create another modified system file. Private user-layer files are never committed.
 
 The updater is run without `--force`, so locally changed system files remain intact while all non-overlapping system files move to 1.32.0. Afterward, the Workday provider is intentionally reconstructed from the upstream 1.32 implementation and the local `myworkdaysite.com` URL support is reapplied. The upstream implementation is the base because its facet-splitting recovery and CXS URL handling are important for large employers. The Ashby fallback is retained because upstream 1.32 does not contain equivalent hosted-page recovery. The MobiCloud provider remains a separate provider and is checked against the upgraded provider loader.
 
@@ -36,9 +36,9 @@ Expansion has four independent evidence streams:
 1. **DOL-first unresolved replay:** rebuild the resolution state against the upgraded `portals.yml`, refreshed public ATS caches, and reviewed aliases. This is the authoritative universe.
 2. **Built In discovery:** use the new aggregator provider for broad Sunny title/location queries, extract employer brands, then join each brand back to the DOL universe before ATS resolution.
 3. **H-1B sponsor enrichment:** enable the new sponsor plugin when it is locally available and use it as additional evidence during evaluation and alias review. It supplements rather than replaces Sunny's FY2026 Q3 DOL table.
-4. **ATS resolution:** run `discover-ats.mjs` and the checkpointed Sunny resolver across unresolved identities. Accept live Greenhouse, Ashby, Lever, Workday, Workable, SmartRecruiters, Recruitee, BambooHR, Breezy, Pinpoint, Rippling, Join, and other supported first-party providers. Workday still requires an official URL or coordinates; it is never brute-forced.
+4. **ATS resolution with an ownership gate:** run `discover-ats.mjs` and the checkpointed Sunny resolver across unresolved identities, but treat a live board as a candidate rather than proof. Greenhouse, Ashby, and Lever candidates must publish an owner that canonically equals the DOL/DBA/reviewed alias identity. Other providers require an exact accepted URL in `profiles/sunny-h1b-ats-identity-reviews.yml` or evidence that the employer's official site links to that ATS URL. Workday still requires an official URL or coordinates; it is never brute-forced. Collision-prone prefix matches such as Mercury/Mercury Systems and Scale/Scale AI fail closed.
 
-Every input identity ends in one durable state: already covered, newly resolved, live-empty, unsupported official careers page, ambiguous, explicitly excluded, invalid identity, dead board, or unresolved. Repeating the same pass must add zero duplicates.
+Every input identity ends in one durable v2 state: `already_covered`, `owner_verified`, `reviewed_official_link`, `live_empty`, `owner_mismatch`, `owner_unreachable`, `unsupported_official`, `ambiguous`, `excluded`, `invalid_identity`, `dead`, `partial`, `error`, or `unresolved`. Only `owner_verified` and `reviewed_official_link` may enter `portals.yml`. Repeating the same pass must add zero duplicates. A versioned checkpoint replays all old unresolved/error records once after the upgrade and supports explicit `--retry-statuses` thereafter.
 
 ## Data Flow
 
@@ -71,7 +71,7 @@ DOL FY2026 Q3 CHANGE_EMPLOYER + NYC Metro geography
 - Upgrade failure: stop, preserve the updater log, and recover through the generated backup branch/WIP ref; do not rerun with `--force`.
 - Provider merge failure: restore the 1.32 upstream provider and reapply only the smallest proven local behavior behind focused tests.
 - ATS timeout or transient 429/5xx: retain an error/checkpoint state and retry with the existing bounded retry policy; never classify it as an empty board.
-- Partial Workday board: report partial/facet recovery state in the scan receipt and do not treat a partial zero as a trustworthy zero.
+- Partial Workday board: record partial/facet recovery in the portal-health log; the v1 scan receipt does not carry this state. Do not treat a partial zero as a trustworthy zero.
 - Aggregator-only employer: retain as a discovery lead until DOL identity and official ATS evidence are established.
 - Alias collision: withhold the company rather than attach another employer's board.
 
@@ -84,7 +84,7 @@ The upgrade is accepted only when:
 3. Upstream Workday facet/CXS tests and the local `myworkdaysite.com` test pass together.
 4. Ashby fallback, MobiCloud, Sunny title filter, geography, identity resolution, and dedup tests pass.
 5. `node test-all.mjs`, portal validation, and `git diff --check` pass.
-6. A dry scan produces a machine-readable receipt and distinguishes success, empty, error, dead, and partial boards.
+6. A dry scan produces the documented `careerops.scan.receipt@1` counters and URLs. A separate portal-health artifact from strict verification records live, empty, missing/dead, partial, and transient-error states.
 
 The expansion is accepted only when:
 
