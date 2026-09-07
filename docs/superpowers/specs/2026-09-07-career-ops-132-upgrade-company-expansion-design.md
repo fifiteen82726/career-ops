@@ -71,7 +71,7 @@ DOL FY2026 Q3 CHANGE_EMPLOYER + NYC Metro geography
 - Upgrade failure: stop, preserve the updater log, and recover through the generated backup branch/WIP ref; do not rerun with `--force`.
 - Provider merge failure: restore the 1.32 upstream provider and reapply only the smallest proven local behavior behind focused tests.
 - ATS timeout or transient 429/5xx: retain an error/checkpoint state and retry with the existing bounded retry policy; never classify it as an empty board.
-- Partial Workday board: run a full-board Workday health audit without the one-page liveness cap and record `jobs.workdayTruncated` as `health_status=partial`. The v1 scan receipt and bounded `verify-portals` probe do not carry this state. Do not treat a partial zero as a trustworthy zero.
+- Partial Workday board: run a full-board Workday health audit without the one-page liveness cap and record `jobs.workdayTruncated` as `health_status=partial`. Run it once for the pre-expansion baseline and again after every ownership-gated write pass so newly admitted Workday URLs are included. Rejoin the post-write artifact before final resolution counts. The v1 scan receipt and bounded `verify-portals` probe do not carry this state. Do not treat a partial zero as a trustworthy zero.
 - Aggregator-only employer: retain as a discovery lead until DOL identity and official ATS evidence are established.
 - Alias collision: withhold the company rather than attach another employer's board.
 

@@ -354,6 +354,16 @@ For unresolved high-volume Metro identities, obtain official careers URLs, extra
 
 Repeat both ownership-gated write commands. Expected: `added: 0` and no change to `portals.yml`.
 
+- [ ] **Step 7: Re-audit every Workday board after writes**
+
+Run the full-board auditor again against the updated `portals.yml` and write a distinct post-write artifact:
+
+```bash
+node data/tools/audit-sunny-workday-health.mjs --portals portals.yml --output data/cache/dol/sunny-workday-health-post-write-2026-09-07.jsonl --concurrency 4
+```
+
+Update `tests/sunny-workday-health.test.mjs` with an integration fixture in which a Workday URL absent from the baseline portals fixture is admitted by an ownership-gated write, appears in the post-write health artifact, returns an array carrying `jobs.workdayTruncated`, and becomes `health_status=partial`. Rejoin the post-write artifact into the v2 checkpoint/resolution and rebuild counts. The pre-write artifact is historical baseline evidence only and must not drive final Workday health counts.
+
 ### Task 7: Final coverage audit and operational handoff
 
 **Files:**
@@ -371,7 +381,7 @@ node validate-portals.mjs
 node verify-portals.mjs --strict
 ```
 
-Save the strict verification output as bounded liveness evidence. Use `data/cache/dol/sunny-workday-health-2026-09-07.jsonl`, not the bounded probe, for Workday partial counts. If strict mode exits non-zero, separate definitive missing/dead boards from transient errors, retry only transient errors once, and report the remaining states instead of claiming a clean reachability sweep. Record final portal-entry, linked-identity, unresolved, ambiguous, review-required, live-empty, dead, transient-error, and partial counts from the v2 resolution plus both health artifacts.
+Save the strict verification output as bounded liveness evidence. Use `data/cache/dol/sunny-workday-health-post-write-2026-09-07.jsonl`, not the bounded probe or pre-write artifact, for final Workday health/partial counts. If strict mode exits non-zero, separate definitive missing/dead boards from transient errors, retry only transient errors once, and report the remaining states instead of claiming a clean reachability sweep. Record final portal-entry, linked-identity, unresolved, ambiguous, review-required, live-empty, dead, transient-error, and partial counts from the rebuilt v2 resolution plus bounded liveness and post-write full-board health evidence.
 
 - [ ] **Step 2: Run a bounded three-day production-like scan**
 
