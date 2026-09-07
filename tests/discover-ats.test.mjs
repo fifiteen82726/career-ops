@@ -382,7 +382,15 @@ const httpErrorCtx = (statusByVendor) => ({
     err.status = status;
     throw err;
   },
-  fetchText: async () => { throw new Error('unused'); },
+  // The local Ashby extension retries a posting-api 404 against the official
+  // hosted board. Model that second endpoint with the same status so this
+  // fixture still means "every public surface definitively answered 404".
+  fetchText: async () => {
+    const status = statusByVendor.ashby ?? 404;
+    const err = new Error(`HTTP ${status}${status === 404 ? ' Not Found' : ''}`);
+    err.status = status;
+    throw err;
+  },
 });
 const SLUG_VENDORS = ['gh', 'ashby', 'lever'];
 

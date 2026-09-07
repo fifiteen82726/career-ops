@@ -11,7 +11,7 @@
 // Ashby a longer timeout plus a backoff+jitter retry (the backoff spaces
 // requests out to dodge rate-limiting).
 // See .planning/codebase/ashby-scan-abort-diagnosis.md.
-import { fetchJsonWithRetry } from './_http.mjs';
+import { fetchJsonWithRetry, fetchTextWithRetry } from './_http.mjs';
 
 const ASHBY_TIMEOUT_MS = 30_000;
 const ASHBY_RETRIES = 2;
@@ -79,6 +79,7 @@ export function parseCompensation(job) {
 }
 
 const ALLOWED_ASHBY_HOSTS = new Set(['api.ashbyhq.com']);
+const ALLOWED_ASHBY_PAGE_HOSTS = new Set(['jobs.ashbyhq.com']);
 
 /** @param {string} url */
 function assertAshbyUrl(url) {
@@ -92,6 +93,55 @@ function assertAshbyUrl(url) {
   if (!ALLOWED_ASHBY_HOSTS.has(parsed.hostname))
     throw new Error(`ashby: untrusted hostname "${parsed.hostname}" — must be one of: ${[...ALLOWED_ASHBY_HOSTS].join(', ')}`);
   return url;
+}
+
+/** @param {import('./_types.js').PortalEntry} entry */
+function resolveHostedUrl(entry) {
+  if (!entry.careers_url) return null;
+  let parsed;
+  try { parsed = new URL(entry.careers_url); }
+  catch { return null; }
+  if (parsed.protocol !== 'https:' || !ALLOWED_ASHBY_PAGE_HOSTS.has(parsed.hostname)) return null;
+  if (!/^\/[^/]+\/?$/.test(parsed.pathname)) return null;
+  parsed.search = '';
+  parsed.hash = '';
+  parsed.pathname = parsed.pathname.replace(/\/+$/, '');
+  return parsed.href.replace(/\/$/, '');
+}
+
+/**
+ * Extract Ashby's server-rendered `window.__appData` without evaluating page
+ * JavaScript. Some otherwise public boards disable posting-api while keeping
+ * the same job inventory in this JSON assignment.
+ * @param {string} html
+ */
+function parseHostedAppData(html) {
+  const marker = 'window.__appData';
+  const markerAt = String(html || '').indexOf(marker);
+  if (markerAt < 0) throw new Error('ashby: hosted page is missing window.__appData');
+  const equalsAt = html.indexOf('=', markerAt + marker.length);
+  const objectAt = html.indexOf('{', equalsAt + 1);
+  if (equalsAt < 0 || objectAt < 0) throw new Error('ashby: hosted page has malformed window.__appData');
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = objectAt; index < html.length; index += 1) {
+    const char = html[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === '{') depth += 1;
+    else if (char === '}') {
+      depth -= 1;
+      if (depth === 0) return JSON.parse(html.slice(objectAt, index + 1));
+    }
+  }
+  throw new Error('ashby: hosted page has unterminated window.__appData');
 }
 
 /** @param {import('./_types.js').PortalEntry} entry */
@@ -144,11 +194,13 @@ function toEpochMs(value) {
 /** @param {any} j */
 function formatLocation(j) {
   const parts = [];
-  if (typeof j.location === 'string' && j.location.trim()) parts.push(j.location.trim());
+  const primaryLocation = typeof j.location === 'string' ? j.location : j.locationName;
+  if (typeof primaryLocation === 'string' && primaryLocation.trim()) parts.push(primaryLocation.trim());
   if (Array.isArray(j.secondaryLocations)) {
     for (const s of j.secondaryLocations) {
       if (!s || typeof s !== 'object') continue;
-      if (typeof s.location === 'string' && s.location.trim()) parts.push(s.location.trim());
+      const secondaryLocation = typeof s.location === 'string' ? s.location : s.locationName;
+      if (typeof secondaryLocation === 'string' && secondaryLocation.trim()) parts.push(secondaryLocation.trim());
       const pa = s.address && s.address.postalAddress;
       if (pa) {
         for (const k of ['addressLocality', 'addressCountry']) {
@@ -195,18 +247,36 @@ export default {
     // unchanged — only which errors are worth spending it on. The longer
     // per-request timeout above still applies: it is the Ashby latency floor
     // this provider was given a bespoke timeout for, and it travels as `opts`.
-    const json = /** @type {any} */ (await fetchJsonWithRetry(
-      ctx,
-      apiUrl,
-      { timeoutMs: ASHBY_TIMEOUT_MS, redirect: 'error' },
-      // baseDelayMs is ashby's own 1000ms, not the shared 500ms default. The
-      // longer backoff is deliberate here — see the header: Ashby rate-limits
-      // repeated unauthenticated hits, and spacing requests out is why this
-      // provider had a bespoke loop at all. Only WHICH errors are retried
-      // changes; the timing is preserved.
-      { retries: ASHBY_RETRIES, baseDelayMs: ASHBY_BACKOFF_BASE_MS },
-    ));
-    const jobs = Array.isArray(json?.jobs) ? json.jobs : [];
+    let jobs;
+    try {
+      const json = /** @type {any} */ (await fetchJsonWithRetry(
+        ctx,
+        apiUrl,
+        { timeoutMs: ASHBY_TIMEOUT_MS, redirect: 'error' },
+        // baseDelayMs is ashby's own 1000ms, not the shared 500ms default. The
+        // longer backoff is deliberate here — see the header: Ashby rate-limits
+        // repeated unauthenticated hits, and spacing requests out is why this
+        // provider had a bespoke loop at all. Only WHICH errors are retried
+        // changes; the timing is preserved.
+        { retries: ASHBY_RETRIES, baseDelayMs: ASHBY_BACKOFF_BASE_MS },
+      ));
+      jobs = Array.isArray(json?.jobs) ? json.jobs : [];
+    } catch (error) {
+      const hostedUrl = resolveHostedUrl(entry);
+      if (error?.status !== 404 || !hostedUrl || typeof ctx?.fetchText !== 'function') throw error;
+      const html = await fetchTextWithRetry(
+        ctx,
+        hostedUrl,
+        { timeoutMs: ASHBY_TIMEOUT_MS, redirect: 'error' },
+        { retries: ASHBY_RETRIES, baseDelayMs: ASHBY_BACKOFF_BASE_MS },
+      );
+      const appData = parseHostedAppData(html);
+      const postings = Array.isArray(appData?.jobBoard?.jobPostings) ? appData.jobBoard.jobPostings : [];
+      jobs = postings.map((job) => ({
+        ...job,
+        jobUrl: job?.id ? `${hostedUrl}/${encodeURIComponent(job.id)}` : '',
+      }));
+    }
     return jobs.map(/** @param {any} j */ (j) => ({
       title: j.title || '',
       url: j.jobUrl || '',

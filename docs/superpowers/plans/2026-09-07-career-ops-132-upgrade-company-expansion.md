@@ -16,9 +16,9 @@
 - Create: `config/local-paths.txt`
 - Modify: `.git/info/exclude`
 - Create: `data/cache/upgrade/pre-1.32-user-sha256.tsv`
-- Create outside repo: `/Users/coda/Documents/ChatGPT/career-ops-upgrade-backup-2026-09-07.tgz`
-- Create outside repo: `/Users/coda/Documents/ChatGPT/career-ops-user-data-backup-2026-09-07.tgz`
-- Create outside repo: `/Users/coda/Documents/ChatGPT/career-ops-backup-2026-09-07.sha256`
+- Create outside repo: `<repo-parent>/career-ops-upgrade-backup-2026-09-07.tgz`
+- Create outside repo: `<repo-parent>/career-ops-user-data-backup-2026-09-07.tgz`
+- Create outside repo: `<repo-parent>/career-ops-backup-2026-09-07.sha256`
 - Inspect: `cv.md`, `config/profile.yml`, `modes/_profile.md`, `modes/_custom.md`, `portals.yml`, `data/`, `profiles/`, `outputs/`
 
 - [ ] **Step 1: Record repository and version state**
@@ -47,7 +47,7 @@ Add `/profiles/` and `/outputs/` to `.git/info/exclude`. Do not modify tracked `
 
 - [ ] **Step 3: Save a concrete backup of untracked custom code**
 
-Create `/Users/coda/Documents/ChatGPT/career-ops-upgrade-backup-2026-09-07.tgz` containing:
+Create `<repo-parent>/career-ops-upgrade-backup-2026-09-07.tgz` containing:
 
 ```text
 providers/ashby.mjs
@@ -65,7 +65,7 @@ Do not include `cv.md`, profile data, DOL cache rows, scan history, reports, She
 
 - [ ] **Step 4: Save and verify a restorable private user-data archive**
 
-Create `/Users/coda/Documents/ChatGPT/career-ops-user-data-backup-2026-09-07.tgz` containing exactly the current `portals.yml`, `config/profile.yml`, `modes/_profile.md`, `modes/_custom.md`, `profiles/`, `data/cache/dol/`, `data/scan-history.tsv`, `data/scan-runs.tsv`, and any current Sheet payload state under `outputs/`. Missing optional files are recorded in the backup log rather than treated as an empty successful archive. Store SHA-256 values for both dated archives in `/Users/coda/Documents/ChatGPT/career-ops-backup-2026-09-07.sha256`, list both archives, and test-extract each into its own `mktemp -d` directory before any updater or company write. The test extraction must contain `portals.yml` and `profiles/sunny-h1b-ats-identity-reviews.yml`.
+Create `<repo-parent>/career-ops-user-data-backup-2026-09-07.tgz` containing exactly the current `portals.yml`, `config/profile.yml`, `modes/_profile.md`, `modes/_custom.md`, `profiles/`, `data/cache/dol/`, `data/scan-history.tsv`, `data/scan-runs.tsv`, and any current Sheet payload state under `outputs/`. Missing optional files are recorded in the backup log rather than treated as an empty successful archive. Store SHA-256 values for both dated archives in `<repo-parent>/career-ops-backup-2026-09-07.sha256`, list both archives, and test-extract each into its own `mktemp -d` directory before any updater or company write. The test extraction must contain `portals.yml` and `profiles/sunny-h1b-ats-identity-reviews.yml`.
 
 - [ ] **Step 5: Write the immutable user-file checksum manifest**
 
