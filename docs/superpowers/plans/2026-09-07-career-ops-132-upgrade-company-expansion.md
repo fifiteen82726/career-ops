@@ -17,6 +17,8 @@
 - Modify: `.git/info/exclude`
 - Create: `data/cache/upgrade/pre-1.32-user-sha256.tsv`
 - Create outside repo: `/Users/coda/Documents/ChatGPT/career-ops-upgrade-backup-2026-09-07.tgz`
+- Create outside repo: `/Users/coda/Documents/ChatGPT/career-ops-user-data-backup-2026-09-07.tgz`
+- Create outside repo: `/Users/coda/Documents/ChatGPT/career-ops-backup-2026-09-07.sha256`
 - Inspect: `cv.md`, `config/profile.yml`, `modes/_profile.md`, `modes/_custom.md`, `portals.yml`, `data/`, `profiles/`, `outputs/`
 
 - [ ] **Step 1: Record repository and version state**
@@ -61,11 +63,15 @@ data/tools/
 
 Do not include `cv.md`, profile data, DOL cache rows, scan history, reports, Sheet payloads, or credentials in a commit or public patch.
 
-- [ ] **Step 4: Write the immutable user-file checksum manifest**
+- [ ] **Step 4: Save and verify a restorable private user-data archive**
+
+Create `/Users/coda/Documents/ChatGPT/career-ops-user-data-backup-2026-09-07.tgz` containing exactly the current `portals.yml`, `config/profile.yml`, `modes/_profile.md`, `modes/_custom.md`, `profiles/`, `data/cache/dol/`, `data/scan-history.tsv`, `data/scan-runs.tsv`, and any current Sheet payload state under `outputs/`. Missing optional files are recorded in the backup log rather than treated as an empty successful archive. Store SHA-256 values for both dated archives in `/Users/coda/Documents/ChatGPT/career-ops-backup-2026-09-07.sha256`, list both archives, and test-extract each into its own `mktemp -d` directory before any updater or company write. The test extraction must contain `portals.yml` and `profiles/sunny-h1b-ats-identity-reviews.yml`.
+
+- [ ] **Step 5: Write the immutable user-file checksum manifest**
 
 Write tab-separated SHA-256 hashes for `cv.md`, `config/profile.yml`, `modes/_profile.md`, and `modes/_custom.md` into `data/cache/upgrade/pre-1.32-user-sha256.tsv`. Record `portals.yml` separately as the mutable pre-expansion baseline. The post-upgrade check must compare these four immutable files byte-for-byte before any company write.
 
-- [ ] **Step 5: Run the current focused baseline tests**
+- [ ] **Step 6: Run the current focused baseline tests**
 
 Run:
 
@@ -139,7 +145,7 @@ resolves to:
 https://wd3.myworkdaysite.com/wday/cxs/brevanhoward/BH_ExternalCareers/jobs
 ```
 
-It must also prove that a direct modern CXS URL resolves without corrupting the tenant/site, that returned job URLs use `/recruiting/brevanhoward/BH_ExternalCareers`, and that `workdayDedupKey()` collapses the same requisition across two sites on both `.myworkdayjobs.com` and `.myworkdaysite.com` hosts.
+It must also prove that a direct modern CXS URL resolves without corrupting the tenant/site, that returned job URLs use `/recruiting/brevanhoward/BH_ExternalCareers`, and that `workdayDedupKey()` collapses the same requisition across two sites on both `.myworkdayjobs.com` and `.myworkdaysite.com` hosts. For modern hosts the key must contain `{hostname}:{tenant-from-/recruiting/<tenant>/...}:{requisition-id}`. An inverse test must prove that the same requisition id under two different tenants on `wd3.myworkdaysite.com` does not deduplicate.
 
 Run it against the untouched upstream provider and verify that this local behavior fails before implementation.
 
@@ -151,7 +157,7 @@ Extend the upstream endpoint resolver to accept only this anchored HTTPS shape:
 https://wd*.myworkdaysite.com/recruiting/{tenant}/{site}
 ```
 
-Construct the CXS endpoint on the same host and the job base under `/recruiting/{tenant}/{site}`. Extend the upstream direct-CXS and dedup host validation to the allowlisted `.myworkdaysite.com` shape without weakening its anchored HTTPS/host checks. Preserve the upstream legacy `myworkdayjobs.com` branches, facet splitting, partial markers, and SSRF guards.
+Construct the CXS endpoint on the same host and the job base under `/recruiting/{tenant}/{site}`. Extend the upstream direct-CXS and dedup host validation to the allowlisted `.myworkdaysite.com` shape without weakening its anchored HTTPS/host checks. The modern dedup parser must extract and include the tenant path segment because the host is shared across unrelated employers. Preserve the upstream legacy `myworkdayjobs.com` branches, facet splitting, partial markers, and SSRF guards.
 
 - [ ] **Step 4: Verify Ashby and MobiCloud extensions**
 
@@ -269,6 +275,9 @@ node data/tools/join-sunny-builtin-h1b.mjs --leads data/cache/dol/sunny-builtin-
 - Create: `data/cache/dol/sunny-ny-metro-discovery-v2-2026-09-07.jsonl`
 - Create: `data/tools/sunny-ats-identity-gate.mjs`
 - Create: `tests/sunny-ats-identity-gate.test.mjs`
+- Create: `data/tools/audit-sunny-workday-health.mjs`
+- Create: `tests/sunny-workday-health.test.mjs`
+- Generate: `data/cache/dol/sunny-workday-health-2026-09-07.jsonl`
 - Modify: `data/tools/run-sunny-ny-metro-discovery.mjs`
 - Modify: `data/tools/build-sunny-ny-metro-resolution.mjs`
 - Modify: `portals.yml`
@@ -285,11 +294,11 @@ Record exact already-covered, unresolved, ambiguous, invalid, excluded, and erro
 
 - [ ] **Step 2: Implement the ownership and durable-state gate**
 
-Create `sunny-ats-identity-gate.mjs`, exporting `canonicalIdentityTokens()`, `classifyPublishedOwner()`, `reviewedUrlVerdict()`, and `classifyDiscoveryCandidate()`. Reuse the strict equality semantics of `verify-portals.mjs`'s `boardIdentityMatches`: legal suffixes may be removed, but prefixes/substrings never match. Greenhouse/Ashby/Lever require a fetched published owner. All other providers require an exact accepted `identity + careers_url` review or an official-site link recorded in the reviews file. Return one of the v2 statuses in the design; never return a writable state on timeout, missing owner, prefix match, or guessed long-tail slug.
+Create `sunny-ats-identity-gate.mjs`, exporting `canonicalIdentityTokens()`, `classifyPublishedOwner()`, `reviewedUrlVerdict()`, and `classifyDiscoveryCandidate()`. Reuse the strict equality semantics of `verify-portals.mjs`'s `boardIdentityMatches`: legal suffixes may be removed, but prefixes/substrings never match. Greenhouse/Ashby/Lever require a fetched published owner. All other providers require an exact accepted `identity + careers_url` review or an official-site link recorded in the reviews file. A guessed live long-tail slug receives `identity_status=review_required`; it is non-writable. Never return a writable identity status on timeout, missing owner, prefix match, or guessed long-tail slug.
 
-Update `run-sunny-ny-metro-discovery.mjs` so `--write` accepts only `owner_verified` and `reviewed_official_link`. Add `schemaVersion: 2`, `runId`, `provider`, `careersUrl`, `boardOwner`, `evidence`, and `status` to every checkpoint record. Add `--retry-statuses unresolved,error,owner_unreachable,partial` and ensure only those statuses are requeued. Update `build-sunny-ny-metro-resolution.mjs` to consume the v2 checkpoint and preserve every terminal state in the final TSV.
+Update `run-sunny-ny-metro-discovery.mjs` so `--write` requires `identity_status` in `owner_verified,reviewed_official_link` and `health_status` in `live,partial`. Add `schemaVersion: 2`, `runId`, `provider`, `careersUrl`, `boardOwner`, `evidence`, `identity_status`, and `health_status` to every checkpoint record. Add `--retry-identity-statuses unresolved,owner_unreachable` and `--retry-health-statuses transient_error,partial`; accepted/live records are never requeued. Update `build-sunny-ny-metro-resolution.mjs` to consume the v2 checkpoint and preserve both axes in the final TSV.
 
-Tests must prove Mercury/Mercury Systems and Scale/Scale AI fail closed, an exact owner passes, a reviewed Workday URL passes, a guessed Workable slug remains review-required, old unresolved/error records can be replayed, accepted records are not replayed, malformed checkpoint tails are ignored, and only the two writable statuses reach `portals.yml`.
+Tests must prove Mercury/Mercury Systems and Scale/Scale AI fail closed, an exact owner passes, a reviewed Workday URL passes, a guessed Workable slug receives the exact `review_required` identity status, old unresolved/error records can be replayed, accepted records are not replayed, malformed checkpoint tails are ignored, and only accepted identity plus live/partial health combinations reach `portals.yml`.
 
 Run:
 
@@ -300,6 +309,17 @@ node tests/sunny-ny-metro-resolution.test.mjs
 ```
 
 - [ ] **Step 3: Run the checkpointed unresolved-company resolver**
+
+Before the live run, create `audit-sunny-workday-health.mjs`. It loads only Workday entries through the provider registry and performs a full provider fetch without `ctx.maxPages=1`. Export `classifyWorkdayHealth(jobs, error)` so tests prove: a non-empty ordinary array is `live`; an empty complete array is `live_empty`; `jobs.workdayTruncated` is `partial`; a definitive gone response is `dead`; and retryable network/429/5xx failures are `transient_error`. The output is JSONL keyed by normalized careers URL and includes `jobCount`, `workdayTruncated`, `checkedAt`, and error evidence. Neither `scan.receipt@1`, `verify-portals`, nor `discover-ats` is used as evidence of partial coverage.
+
+Run:
+
+```bash
+node tests/sunny-workday-health.test.mjs
+node data/tools/audit-sunny-workday-health.mjs --portals portals.yml --output data/cache/dol/sunny-workday-health-2026-09-07.jsonl --concurrency 4
+```
+
+Join this health artifact into the v2 resolution/checkpoint by normalized careers URL before any write.
 
 Run the full unresolved set with bounded concurrency and resume support:
 
@@ -313,7 +333,7 @@ Preview resolved entries, verify their DOL identity and live board, then use the
 node data/tools/run-sunny-ny-metro-discovery.mjs --checkpoint data/cache/dol/sunny-ny-metro-discovery-v2-2026-09-07.jsonl --batch-size 50 --concurrency 8 --write
 ```
 
-The new checkpoint intentionally replays the 34 unresolved records in the old checkpoint. Continue until no first-pass pending companies remain. Retry only `unresolved,error,owner_unreachable,partial` explicitly; never restart accepted identities.
+The new checkpoint intentionally replays the 34 unresolved records in the old checkpoint. Continue until no first-pass pending companies remain. Retry only the explicitly named unresolved/unreachable or transient/partial axes; never restart accepted/live identities.
 
 - [ ] **Step 4: Resolve Built In candidates through the same ownership gate**
 
@@ -351,7 +371,7 @@ node validate-portals.mjs
 node verify-portals.mjs --strict
 ```
 
-Save the verification output as the portal-health artifact. If strict mode exits non-zero, separate definitive missing/dead boards from transient errors, retry only transient errors once, and report the remaining states instead of claiming a clean reachability sweep. Record final portal-entry, linked-identity, unresolved, ambiguous, live-empty, dead, error, and partial counts from the v2 resolution plus portal-health evidence.
+Save the strict verification output as bounded liveness evidence. Use `data/cache/dol/sunny-workday-health-2026-09-07.jsonl`, not the bounded probe, for Workday partial counts. If strict mode exits non-zero, separate definitive missing/dead boards from transient errors, retry only transient errors once, and report the remaining states instead of claiming a clean reachability sweep. Record final portal-entry, linked-identity, unresolved, ambiguous, review-required, live-empty, dead, transient-error, and partial counts from the v2 resolution plus both health artifacts.
 
 - [ ] **Step 2: Run a bounded three-day production-like scan**
 
