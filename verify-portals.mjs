@@ -566,6 +566,19 @@ export async function verifyCompanies(
         results.push({ name, ...probe });
         continue;
       }
+      // Ashby's posting API can return a permanent 404 while the public board
+      // page remains live and embeds the same job payload. The scanner's Ashby
+      // provider has a guarded hosted-page fallback for exactly this case, so
+      // the health verifier must consult that real provider before declaring a
+      // board dead. Otherwise a board such as Whatnot scans correctly but fails
+      // `verify-portals --strict` as a false 404.
+      if (match.ats === 'ashby' && probe.errorKind === 'slug_gone' && providers?.has('ashby')) {
+        const providerProbe = await probeProvider(company, providers.get('ashby'), httpCtx || makeHttpCtx());
+        if (providerProbe.status === 'live' || providerProbe.status === 'empty') {
+          results.push({ name, ...providerProbe });
+          continue;
+        }
+      }
       // Wrong slug or ATS migration — cross-probe only for slug/unknown failures.
       if (probe.errorKind === 'slug_gone' || probe.errorKind === 'unknown') {
         const suggested = await discoverAlternates(name, { fetchJson, fetchText });
