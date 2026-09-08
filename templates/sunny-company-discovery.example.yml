@@ -1,0 +1,68 @@
+schema_version: 1
+
+dol_employers: data/cache/dol/sunny-all-title-h1b-employers-fy2026q3.tsv
+ats_candidates: data/cache/dol/sunny-all-title-ats-candidates-2026-09-02.tsv
+
+sources:
+  indeed: true
+  builtin: true
+  linkedin: true
+  google_resolution_only: true
+
+queries:
+  - data engineer
+  - senior data engineer
+  - analytics engineer
+  - business intelligence engineer
+  - BI engineer
+  - BI analyst
+  - data analyst
+  - senior data analyst
+  - finance data analyst
+  - financial data analyst
+  - data platform
+  - data infrastructure
+  - data warehouse
+  - data pipeline
+  - data automation
+  - data management
+  - data operations
+  - data quality
+  - data governance
+  - ETL
+  - ELT
+  - SQL developer
+  - reporting developer
+
+source_modes:
+  backfill:
+    days: 20
+    linkedin_date_posted: past_month
+  incremental:
+    days: 1
+    linkedin_date_posted: past_24_hours
+
+retry:
+  unresolved_days: 7
+  transient_minutes: 180
+
+scan:
+  backfill_days: 20
+  pre_noon_guard_minutes: 30
+
+scopes:
+  nyc:
+    indeed:
+      location: New York, NY
+      radius: 50
+      remote_only: false
+    linkedin:
+      location: New York Metropolitan Area
+      work_type: on_site,hybrid
+  remote:
+    indeed:
+      location: remote
+      remote_only: true
+    linkedin:
+      location: United States
+      work_type: remote
