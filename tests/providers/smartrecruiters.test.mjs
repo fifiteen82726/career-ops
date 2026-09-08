@@ -53,6 +53,7 @@ try {
         id: 'abc-123',
         name: 'Senior PM',
         ref: 'https://api.smartrecruiters.com/v1/companies/sgs/postings/abc-123',
+        releasedDate: '2026-09-03T17:27:58.991Z',
         location: { fullLocation: 'Geneva, Switzerland', remote: false },
       },
       {
@@ -64,6 +65,7 @@ try {
       {
         id: 'ghi-789',
         name: 'No-ref Role',
+        releasedDate: 'not-a-date',
         location: { fullLocation: 'Berlin, Germany' },
       },
     ],
@@ -82,6 +84,13 @@ try {
     pass('parseSmartRecruitersResponse builds location from city/country/remote when no fullLocation');
   } else {
     fail(`row 1 location = ${JSON.stringify(jobs[1]?.location)}, expected "Paris, France, Remote"`);
+  }
+
+  if (jobs[0]?.postedAt === Date.parse('2026-09-03T17:27:58.991Z')
+      && jobs[2]?.postedAt === undefined) {
+    pass('parseSmartRecruitersResponse maps valid releasedDate to postedAt and omits invalid dates');
+  } else {
+    fail(`releasedDate mapping = ${JSON.stringify(jobs.map(j => j.postedAt))}`);
   }
 
   // The public site is /<slug>/<id>-<title-slug> — NOT /<slug>/postings/<id>.
@@ -453,4 +462,3 @@ try {
 } catch (e) {
   fail(`smartrecruiters provider tests crashed: ${e.message}`);
 }
-

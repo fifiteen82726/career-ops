@@ -189,7 +189,7 @@ export default {
  *
  * @param {any} json
  * @param {string} companyName
- * @returns {Array<{title: string, url: string, company: string, location: string, id?: string}>}
+ * @returns {Array<{title: string, url: string, company: string, location: string, id?: string, postedAt?: number}>}
  */
 export function parseSmartRecruitersResponse(json, companyName) {
   const items = json?.content;
@@ -224,6 +224,15 @@ export function parseSmartRecruitersResponse(json, companyName) {
         url = `https://jobs.smartrecruiters.com/${companySlug}/${j.id}${slugified ? `-${slugified}` : ''}`;
       }
     }
-    return { title: j.name || '', url, location, company: companyName, id: typeof j.id === 'string' || typeof j.id === 'number' ? String(j.id) : undefined };
+    const job = {
+      title: j.name || '',
+      url,
+      location,
+      company: companyName,
+      id: typeof j.id === 'string' || typeof j.id === 'number' ? String(j.id) : undefined,
+    };
+    const releasedAt = Date.parse(j.releasedDate);
+    if (Number.isFinite(releasedAt)) job.postedAt = releasedAt;
+    return job;
   });
 }
