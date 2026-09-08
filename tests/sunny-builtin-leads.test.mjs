@@ -4,7 +4,25 @@ import assert from 'node:assert/strict';
 import {
   collectBuiltinLeads,
   dedupeBuiltinLeads,
+  filterBuiltinBackfillWindow,
+  hostsForScope,
 } from '../data/tools/collect-sunny-builtin-leads.mjs';
+
+test('maps one automation scope to exactly one Built In source', () => {
+  assert.deepEqual(hostsForScope('nyc'), [{ host: 'www.builtinnyc.com', scope: '' }]);
+  assert.deepEqual(hostsForScope('remote'), [{ host: 'builtin.com', scope: 'remote' }]);
+  assert.throws(() => hostsForScope('all'), /nyc or remote/);
+});
+
+test('20-day Built In backfill drops only definitely stale dated leads', () => {
+  const rows = filterBuiltinBackfillWindow([
+    { company: 'Recent', posted_at: '2026-09-01T00:00:00.000Z' },
+    { company: 'Old', posted_at: '2026-08-01T00:00:00.000Z' },
+    { company: 'Undated', posted_at: '' },
+  ], { now: Date.parse('2026-09-08T12:00:00Z'), days: 20 });
+
+  assert.deepEqual(rows.map(row => row.company), ['Recent', 'Undated']);
+});
 
 test('dedupes cross-query Built In rows by URL and rejects incomplete identities', () => {
   const rows = dedupeBuiltinLeads([
