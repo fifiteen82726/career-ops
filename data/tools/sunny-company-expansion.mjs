@@ -198,6 +198,11 @@ export function identifierFromAtsUrl(provider, value) {
     return match ? `${match[1]}|${match[2]}|${match[3]}` : '';
   }
   if (provider === 'icims') return url.match(/^https:\/\/([^./]+)\.icims\.com/i)?.[1] || '';
+  if (provider === 'workable') return url.match(/^https:\/\/apply\.workable\.com\/([^/?#]+)/i)?.[1] || '';
+  if (provider === 'smartrecruiters') {
+    return url.match(/^https:\/\/(?:careers|jobs)\.smartrecruiters\.com\/([^/?#]+)/i)?.[1] || '';
+  }
+  if (provider === 'gem') return url.match(/^https:\/\/jobs\.gem\.com\/([^/?#]+)/i)?.[1] || '';
   return '';
 }
 
@@ -217,7 +222,8 @@ export function validateV2Review(review) {
   if (!provider || provider === 'websearch') errors.push('a supported ATS provider is required');
   const expectedIdentifier = clean(review?.board_identifier).toLowerCase();
   const urlIdentifier = identifierFromAtsUrl(provider, review?.careers_url).toLowerCase();
-  if (OWNER_PROVIDERS.has(provider) || ['workday', 'icims'].includes(provider)) {
+  if (OWNER_PROVIDERS.has(provider)
+    || ['workday', 'icims', 'workable', 'smartrecruiters', 'gem'].includes(provider)) {
     if (!urlIdentifier || urlIdentifier !== expectedIdentifier) {
       errors.push('careers URL does not match provider and board identifier');
     }
@@ -373,6 +379,9 @@ export function portalEntryBoardKey(entry) {
     else if (/lever\.co/i.test(source)) provider = 'lever';
     else if (/myworkdayjobs\.com/i.test(source)) provider = 'workday';
     else if (/icims\.com/i.test(source)) provider = 'icims';
+    else if (/apply\.workable\.com/i.test(source)) provider = 'workable';
+    else if (/(?:careers|jobs)\.smartrecruiters\.com/i.test(source)) provider = 'smartrecruiters';
+    else if (/jobs\.gem\.com/i.test(source)) provider = 'gem';
   }
   const identifier = identifierFromAtsUrl(provider, entry?.careers_url)
     || identifierFromAtsUrl(provider, entry?.api);
@@ -505,6 +514,26 @@ export function findAtsCandidatesForDol(dolMatch, candidates) {
   });
 }
 
+function reviewedCandidatesForDol(dolMatch, reviews) {
+  if (dolMatch?.status !== 'dol_accepted') return [];
+  return (reviews || []).filter(review => {
+    if (!validateV2Review(review).accepted) return false;
+    return normalizeCompanyIdentity(review.source_brand) === normalizeCompanyIdentity(dolMatch.preferred_name)
+      && normalizeCompanyIdentity(review.dol_legal_name) === normalizeCompanyIdentity(dolMatch.dol_legal_name)
+      && normalizeCompanyIdentity(review.dol_dba) === normalizeCompanyIdentity(dolMatch.dol_dba);
+  }).map(review => ({
+    employer_name: dolMatch.dol_legal_name,
+    dba: dolMatch.dol_dba,
+    provider: clean(review.ats_provider).toLowerCase(),
+    identifier: clean(review.board_identifier),
+    careers_url: clean(review.careers_url),
+    job_count: '0',
+    match_status: 'candidate',
+    verification: 'live',
+    reviewed: true,
+  }));
+}
+
 function aggregateLeadCompanies(leads, scope) {
   const groups = new Map();
   for (const lead of leads || []) {
@@ -543,6 +572,40 @@ function portalNameIdentities(portals) {
     .filter(Boolean));
 }
 
+function trackedEvidenceKey(value) {
+  const raw = clean(value);
+  if (!raw) return '';
+  for (const provider of ['greenhouse', 'ashby', 'lever', 'workday', 'icims']) {
+    const identifier = identifierFromAtsUrl(provider, raw);
+    if (identifier) return `${provider}\t${identifier.toLowerCase()}`;
+  }
+  try {
+    const url = new URL(raw);
+    url.hash = '';
+    url.search = '';
+    url.hostname = url.hostname.toLowerCase();
+    url.pathname = url.pathname.replace(/\/+$/, '') || '/';
+    return url.toString();
+  } catch {
+    return raw.replace(/\/+$/, '').toLowerCase();
+  }
+}
+
+function acceptedTrackedLegacyAliases(portals, reviews) {
+  const tracked = new Set();
+  for (const entry of portals?.tracked_companies || []) {
+    for (const value of [entry.careers_url, entry.api]) {
+      const key = trackedEvidenceKey(value);
+      if (key) tracked.add(key);
+    }
+  }
+  return new Set((reviews || [])
+    .filter(review => review?.verdict === 'accept')
+    .filter(review => tracked.has(trackedEvidenceKey(review.careers_url)))
+    .map(review => normalizeCompanyIdentity(review.identity))
+    .filter(Boolean));
+}
+
 function preserveBackfill(accepted, previous, now, backfillDays) {
   if (previous?.status === 'accepted'
     && portalBoardKey(previous) === portalBoardKey(accepted)
@@ -572,15 +635,18 @@ export async function resolveCompanyLeads({
   candidates,
   portals,
   reviews = [],
+  legacyReviews = [],
   currentState = [],
   now = new Date(),
   backfillDays = 20,
   unresolvedDays = 7,
   transientMinutes = 180,
+  forceRetry = false,
   evaluateCandidate = evaluateAtsCandidate,
 } = {}) {
   if (!['nyc', 'remote'].includes(scope)) throw new Error('scope must be nyc or remote');
   const trackedNames = portalNameIdentities(portals);
+  const trackedLegacyAliases = acceptedTrackedLegacyAliases(portals, legacyReviews);
   const trackedBoards = new Set((portals?.tracked_companies || [])
     .map(portalEntryBoardKey).filter(Boolean));
   const previousByIdentity = new Map((currentState || [])
@@ -590,7 +656,7 @@ export async function resolveCompanyLeads({
   for (const group of aggregateLeadCompanies(leads, scope)) {
     const previous = previousByIdentity.get(group.normalized_lead);
     const hasNewEvidence = !previous?.last_seen || group.last_seen > previous.last_seen;
-    if (previous && !hasNewEvidence && !retryIsDue(previous, now)) {
+    if (!forceRetry && previous && !hasNewEvidence && !retryIsDue(previous, now)) {
       results.push(previous);
       continue;
     }
@@ -610,7 +676,7 @@ export async function resolveCompanyLeads({
       });
       continue;
     }
-    if (trackedNames.has(group.normalized_lead)) {
+    if (trackedNames.has(group.normalized_lead) || trackedLegacyAliases.has(group.normalized_lead)) {
       results.push({ ...base, status: 'already_tracked', reason: 'company name is already tracked' });
       continue;
     }
@@ -633,8 +699,36 @@ export async function resolveCompanyLeads({
       continue;
     }
 
-    const matchedCandidates = findAtsCandidatesForDol(dol, candidates)
-      .sort((left, right) => Number(right.job_count || 0) - Number(left.job_count || 0));
+    const dolCoveredByLegacyBoard = [dol.dol_legal_name, dol.dol_dba]
+      .map(normalizeCompanyIdentity)
+      .some(identity => identity && trackedLegacyAliases.has(identity));
+    if (dolCoveredByLegacyBoard) {
+      results.push({
+        ...base,
+        ...dol,
+        normalized_lead: group.normalized_lead,
+        preferred_name: group.preferred_name,
+        status: 'already_tracked',
+        reason: 'accepted legacy legal identity points to an already tracked board',
+      });
+      continue;
+    }
+
+    const matchedCandidates = [];
+    const seenCandidateBoards = new Set();
+    for (const candidate of [
+      ...findAtsCandidatesForDol(dol, candidates),
+      ...reviewedCandidatesForDol(dol, reviews),
+    ]) {
+      const key = portalBoardKey({
+        provider: candidate.provider,
+        board_identifier: candidate.identifier,
+      });
+      if (!key || seenCandidateBoards.has(key)) continue;
+      seenCandidateBoards.add(key);
+      matchedCandidates.push(candidate);
+    }
+    matchedCandidates.sort((left, right) => Number(right.job_count || 0) - Number(left.job_count || 0));
     const trackedCandidate = matchedCandidates.find(candidate => trackedBoards.has(portalBoardKey({
       provider: candidate.provider,
       board_identifier: candidate.identifier,
@@ -768,6 +862,9 @@ export async function runResolution({
   const employers = loadTsv(dataPath(dataRoot, config.dol_employers));
   const candidates = loadTsv(dataPath(dataRoot, config.ats_candidates));
   const reviewsDoc = existsSync(paths.reviewsV2) ? readYaml(paths.reviewsV2) : { reviews: [] };
+  const legacyReviewsDoc = existsSync(paths.legacyReviews)
+    ? readYaml(paths.legacyReviews)
+    : { reviews: [] };
   if (Number(reviewsDoc.schema_version) !== 2 || !Array.isArray(reviewsDoc.reviews)) {
     throw new Error('v2 identity review file must have schema_version: 2 and reviews: []');
   }
@@ -781,11 +878,13 @@ export async function runResolution({
     candidates,
     portals,
     reviews: reviewsDoc.reviews,
+    legacyReviews: Array.isArray(legacyReviewsDoc.reviews) ? legacyReviewsDoc.reviews : [],
     currentState,
     now,
     backfillDays: Number(config.scan?.backfill_days || 20),
     unresolvedDays: Number(config.retry?.unresolved_days || 7),
     transientMinutes: Number(config.retry?.transient_minutes || 180),
+    forceRetry: mode === 'backfill',
   });
 
   await updateResolutionRows(rows, { dataRoot });

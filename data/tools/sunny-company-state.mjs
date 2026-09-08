@@ -39,6 +39,7 @@ export function statePaths(dataRoot = getCareerOpsRoot()) {
     root: dataRoot,
     config: join(dataRoot, 'profiles/sunny-company-discovery.yml'),
     reviewsV2: join(dataRoot, 'profiles/sunny-company-identity-reviews-v2.yml'),
+    legacyReviews: join(dataRoot, 'profiles/sunny-h1b-ats-identity-reviews.yml'),
     portals: join(dataRoot, 'portals.yml'),
     leads: join(dataRoot, 'data/sunny-company-leads.tsv'),
     resolution: join(dataRoot, 'data/sunny-company-resolution.tsv'),

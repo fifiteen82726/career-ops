@@ -8,10 +8,12 @@ import * as yaml from 'js-yaml';
 import {
   commitPortalAdmissions,
   evaluateAtsCandidate,
+  identifierFromAtsUrl,
   isScannableAdmission,
   joinLeadToDol,
   parseArgs,
   portalBoardKey,
+  portalEntryBoardKey,
   resolveCompanyLeads,
   validateV2Review,
 } from '../data/tools/sunny-company-expansion.mjs';
@@ -85,6 +87,57 @@ test('v2 review must prove source, DOL, and ATS identities', () => {
     ...validReview,
     careers_url: 'https://job-boards.greenhouse.io/another',
   }).accepted, false);
+});
+
+test('Workable reviews require an exact tenant and deduplicate by tenant', () => {
+  const review = {
+    ...validReview,
+    ats_provider: 'workable',
+    board_identifier: 'claritas-rx',
+    careers_url: 'https://apply.workable.com/claritas-rx/',
+  };
+
+  assert.equal(validateV2Review(review).accepted, true);
+  assert.equal(validateV2Review({
+    ...review,
+    careers_url: 'https://apply.workable.com/another-company/',
+  }).accepted, false);
+  assert.equal(identifierFromAtsUrl('workable', review.careers_url), 'claritas-rx');
+  assert.equal(
+    portalEntryBoardKey({ provider: 'workable', careers_url: review.careers_url }),
+    portalBoardKey({ provider: 'workable', board_identifier: 'claritas-rx' }),
+  );
+});
+
+test('reviewed SmartRecruiters and Gem boards use stable board identities', () => {
+  const cases = [
+    {
+      provider: 'smartrecruiters',
+      identifier: 'integrichain1',
+      url: 'https://careers.smartrecruiters.com/integrichain1',
+    },
+    {
+      provider: 'gem',
+      identifier: 'vantaca',
+      url: 'https://jobs.gem.com/vantaca',
+    },
+  ];
+
+  for (const item of cases) {
+    const review = {
+      ...validReview,
+      ats_provider: item.provider,
+      board_identifier: item.identifier,
+      careers_url: item.url,
+    };
+    assert.equal(validateV2Review(review).accepted, true, item.provider);
+    assert.equal(identifierFromAtsUrl(item.provider, item.url), item.identifier);
+    assert.equal(
+      portalEntryBoardKey({ provider: item.provider, careers_url: item.url }),
+      portalBoardKey({ provider: item.provider, board_identifier: item.identifier }),
+      item.provider,
+    );
+  }
 });
 
 test('official careers only and non-ATS records are not writable portals', () => {
@@ -190,6 +243,127 @@ test('resolution groups leads, skips tracked companies, and anchors accepted bac
   assert.equal(accepted.backfill_status, 'pending');
   assert.equal(accepted.backfill_window_start, '2026-08-20');
   assert.equal(accepted.backfill_window_end, '2026-09-08');
+});
+
+test('manual backfill can force a fresh DOL decision while incremental honors cooldown', async () => {
+  const leads = [{
+    source_company: 'Zero', normalized_source_company: 'zero', source: 'builtin', scope: 'nyc',
+    discovered_at: '2026-09-08T10:00:00Z', job_url: 'https://builtinnyc.com/job/zero',
+  }];
+  const currentState = [{
+    normalized_lead: 'zero', preferred_name: 'Zero', status: 'ats_unresolved',
+    last_seen: '2026-09-08T10:00:00Z', next_retry_at: '2026-09-15T10:00:00Z',
+  }];
+  const input = {
+    leads,
+    scope: 'nyc',
+    employers: [{ EMPLOYER_NAME: 'Zero Inc.', DBA: 'Zero', transfer_positions: '0' }],
+    candidates: [],
+    portals: { tracked_companies: [] },
+    currentState,
+    now: new Date('2026-09-08T14:00:00Z'),
+  };
+
+  const incremental = await resolveCompanyLeads(input);
+  const backfill = await resolveCompanyLeads({ ...input, forceRetry: true });
+
+  assert.equal(incremental[0].status, 'ats_unresolved');
+  assert.equal(backfill[0].status, 'dol_rejected');
+});
+
+test('accepted legacy alias skips re-verification only when its board is already tracked', async () => {
+  const rows = await resolveCompanyLeads({
+    leads: [{
+      source_company: 'Hinge', normalized_source_company: 'hinge', source: 'builtin', scope: 'nyc',
+      discovered_at: '2026-09-08T10:00:00Z', job_url: 'https://builtinnyc.com/job/hinge',
+    }],
+    scope: 'nyc',
+    employers: [],
+    candidates: [],
+    portals: { tracked_companies: [{
+      name: 'Match Group', provider: 'lever', careers_url: 'https://jobs.lever.co/matchgroup',
+    }] },
+    legacyReviews: [{
+      identity: 'Hinge, Inc.', careers_url: 'https://jobs.lever.co/matchgroup', verdict: 'accept',
+    }],
+    forceRetry: true,
+  });
+  const wrongBoard = await resolveCompanyLeads({
+    leads: [{
+      source_company: 'Hinge', normalized_source_company: 'hinge', source: 'builtin', scope: 'nyc',
+      discovered_at: '2026-09-08T10:00:00Z', job_url: 'https://builtinnyc.com/job/hinge',
+    }],
+    scope: 'nyc',
+    employers: [],
+    candidates: [],
+    portals: { tracked_companies: [] },
+    legacyReviews: [{
+      identity: 'Hinge, Inc.', careers_url: 'https://jobs.lever.co/matchgroup', verdict: 'accept',
+    }],
+    forceRetry: true,
+  });
+
+  assert.equal(rows[0].status, 'already_tracked');
+  assert.equal(wrongBoard[0].status, 'dol_rejected');
+});
+
+test('accepted legacy legal identity covers a tracked board after the DOL join', async () => {
+  const rows = await resolveCompanyLeads({
+    leads: [{
+      source_company: 'Fanatics', normalized_source_company: 'fanatics', source: 'builtin', scope: 'nyc',
+      discovered_at: '2026-09-08T10:00:00Z', job_url: 'https://builtinnyc.com/job/fanatics',
+    }],
+    scope: 'nyc',
+    employers: [{
+      EMPLOYER_NAME: 'Fanatics Retail Group Fulfillment LLC', DBA: 'Fanatics', transfer_positions: '3',
+    }],
+    candidates: [],
+    portals: { tracked_companies: [{
+      name: 'Fanatics Loyalty, LLC', provider: 'greenhouse',
+      careers_url: 'https://job-boards.greenhouse.io/fanaticsinc',
+    }] },
+    legacyReviews: [{
+      identity: 'Fanatics Retail Group Fulfillment LLC',
+      careers_url: 'https://job-boards.greenhouse.io/fanaticsinc', verdict: 'accept',
+    }],
+    forceRetry: true,
+  });
+
+  assert.equal(rows[0].status, 'already_tracked');
+});
+
+test('an accepted v2 official-link review can supply a new ATS candidate', async () => {
+  const review = {
+    source_brand: 'Example',
+    dol_legal_name: 'Example Holdings, Inc.',
+    dol_dba: 'Example',
+    dol_evidence_urls: ['https://example.com/legal'],
+    ats_provider: 'workday',
+    board_identifier: 'example|wd5|External',
+    board_owner: 'Example',
+    careers_url: 'https://example.wd5.myworkdayjobs.com/External',
+    official_evidence_urls: ['https://example.com/careers'],
+    verdict: 'accept',
+    reviewed_at: '2026-09-08',
+    reason: 'Official careers page links to the Workday board.',
+  };
+  const rows = await resolveCompanyLeads({
+    leads: [{
+      source_company: 'Example', normalized_source_company: 'example', source: 'linkedin', scope: 'remote',
+      discovered_at: '2026-09-08T10:00:00Z', job_url: 'https://linkedin.com/jobs/view/example',
+    }],
+    scope: 'remote',
+    employers,
+    candidates: [],
+    portals: { tracked_companies: [] },
+    reviews: [review],
+    forceRetry: true,
+  });
+
+  assert.equal(rows[0].status, 'accepted');
+  assert.equal(rows[0].provider, 'workday');
+  assert.equal(rows[0].board_identifier, 'example|wd5|External');
+  assert.equal(rows[0].backfill_status, 'pending');
 });
 
 test('portal board identity is exact, so clear never collides with clearstreet', () => {
