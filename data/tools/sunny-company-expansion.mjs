@@ -8,6 +8,7 @@
 
 import {
   existsSync,
+  mkdirSync,
   readFileSync,
   renameSync,
   unlinkSync,
@@ -21,16 +22,87 @@ import { promisify } from 'node:util';
 import * as yaml from 'js-yaml';
 
 import { acquirePipelineLock } from '../../pipeline-lock.mjs';
+import { isMainModule } from '../../lib/is-main-module.mjs';
+import { getCareerOpsRoot } from '../../path-resolver.mjs';
 import { normalizeCompanyIdentity, providerCoordinates } from './build-sunny-h1b-ats-universe.mjs';
+import { ingestLeadRows, readLeadRows } from './sunny-company-leads.mjs';
 import {
   classifyPublishedOwner,
   fetchPublishedBoardOwner,
 } from './sunny-ats-identity-gate.mjs';
-import { statePaths } from './sunny-company-state.mjs';
+import {
+  nextRetryAt,
+  finishBackfill,
+  readResolutionRows,
+  retryIsDue,
+  startBackfill,
+  statePaths,
+  updateResolutionRows,
+} from './sunny-company-state.mjs';
 
 const execFileAsync = promisify(execFile);
 const CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const OWNER_PROVIDERS = new Set(['greenhouse', 'ashby', 'lever']);
+
+function flagOccurrences(args, flag) {
+  return args.filter(token => token === flag || token.startsWith(`${flag}=`));
+}
+
+function flagValue(args, flag) {
+  const occurrences = flagOccurrences(args, flag);
+  if (occurrences.length > 1) throw new Error(`pass exactly one ${flag}`);
+  if (!occurrences.length) return undefined;
+  const token = occurrences[0];
+  if (token.startsWith(`${flag}=`)) return token.slice(flag.length + 1);
+  const index = args.indexOf(token);
+  const value = args[index + 1];
+  return value && !value.startsWith('--') ? value : undefined;
+}
+
+export function parseArgs(argv) {
+  const args = [...argv];
+  const command = args.shift();
+  if (!['ingest', 'run', 'resolve', 'backfill'].includes(command)) {
+    throw new Error('command must be ingest, run, resolve, or backfill');
+  }
+  const scopeOccurrences = flagOccurrences(args, '--scope');
+  if (command !== 'backfill' && scopeOccurrences.length !== 1) {
+    throw new Error('pass exactly one --scope (nyc or remote)');
+  }
+  const scope = flagValue(args, '--scope');
+  if (command !== 'backfill' && !['nyc', 'remote'].includes(scope)) {
+    throw new Error('--scope must be nyc or remote');
+  }
+
+  if (command === 'run') {
+    const mode = flagValue(args, '--mode');
+    if (!['backfill', 'incremental'].includes(mode)) {
+      throw new Error('--mode must be backfill or incremental');
+    }
+    const write = args.includes('--write');
+    const explicitDryRun = args.includes('--dry-run');
+    if (write && explicitDryRun) throw new Error('--write and --dry-run are mutually exclusive');
+    return { command, scope, mode, dryRun: !write, write };
+  }
+
+  if (command === 'resolve') {
+    const write = args.includes('--write');
+    return { command, scope, dryRun: !write, write };
+  }
+
+  if (command === 'ingest') {
+    const source = flagValue(args, '--source');
+    const input = flagValue(args, '--input');
+    if (!['indeed', 'linkedin', 'builtin'].includes(source)) {
+      throw new Error('--source must be indeed, linkedin, or builtin');
+    }
+    if (!input) throw new Error('--input is required');
+    return { command, scope, source, input };
+  }
+
+  if (!args.includes('--pending')) throw new Error('backfill requires --pending');
+  return { command, pending: true };
+}
 
 function clean(value) {
   return String(value ?? '').replace(/[\t\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -430,5 +502,439 @@ export function findAtsCandidatesForDol(dolMatch, candidates) {
     return (employer === legal || (dba && candidateDba === dba))
       && (row.match_status ?? row.status) === 'candidate'
       && ['live', 'partial'].includes(row.verification);
+  });
+}
+
+function aggregateLeadCompanies(leads, scope) {
+  const groups = new Map();
+  for (const lead of leads || []) {
+    if (lead.scope !== scope) continue;
+    const identity = clean(lead.normalized_source_company)
+      || normalizeCompanyIdentity(lead.source_company);
+    if (!identity) continue;
+    const discovered = clean(lead.discovered_at);
+    const current = groups.get(identity) || {
+      normalized_lead: identity,
+      preferred_name: clean(lead.source_company),
+      first_seen: discovered,
+      last_seen: discovered,
+      source_count: 0,
+      evidenceUrls: new Set(),
+    };
+    current.source_count += 1;
+    if (discovered && (!current.first_seen || discovered < current.first_seen)) current.first_seen = discovered;
+    if (discovered && (!current.last_seen || discovered > current.last_seen)) {
+      current.last_seen = discovered;
+      current.preferred_name = clean(lead.source_company) || current.preferred_name;
+    }
+    if (lead.job_url) current.evidenceUrls.add(lead.job_url);
+    groups.set(identity, current);
+  }
+  return [...groups.values()].map(group => ({
+    ...group,
+    evidence: JSON.stringify([...group.evidenceUrls].sort()),
+    evidenceUrls: undefined,
+  }));
+}
+
+function portalNameIdentities(portals) {
+  return new Set((portals?.tracked_companies || [])
+    .map(entry => normalizeCompanyIdentity(entry.name))
+    .filter(Boolean));
+}
+
+function preserveBackfill(accepted, previous, now, backfillDays) {
+  if (previous?.status === 'accepted'
+    && portalBoardKey(previous) === portalBoardKey(accepted)
+    && previous.backfill_status) {
+    return {
+      ...accepted,
+      backfill_status: previous.backfill_status,
+      backfill_window_start: previous.backfill_window_start,
+      backfill_window_end: previous.backfill_window_end,
+      backfill_attempted_at: previous.backfill_attempted_at,
+      backfill_completed_at: previous.backfill_completed_at,
+      backfill_error: previous.backfill_error,
+    };
+  }
+  const anchored = startBackfill(accepted, now, backfillDays);
+  return {
+    ...anchored,
+    backfill_status: 'pending',
+    backfill_attempted_at: '',
+  };
+}
+
+export async function resolveCompanyLeads({
+  leads,
+  scope,
+  employers,
+  candidates,
+  portals,
+  reviews = [],
+  currentState = [],
+  now = new Date(),
+  backfillDays = 20,
+  unresolvedDays = 7,
+  transientMinutes = 180,
+  evaluateCandidate = evaluateAtsCandidate,
+} = {}) {
+  if (!['nyc', 'remote'].includes(scope)) throw new Error('scope must be nyc or remote');
+  const trackedNames = portalNameIdentities(portals);
+  const trackedBoards = new Set((portals?.tracked_companies || [])
+    .map(portalEntryBoardKey).filter(Boolean));
+  const previousByIdentity = new Map((currentState || [])
+    .map(row => [row.normalized_lead, row]));
+  const results = [];
+
+  for (const group of aggregateLeadCompanies(leads, scope)) {
+    const previous = previousByIdentity.get(group.normalized_lead);
+    const hasNewEvidence = !previous?.last_seen || group.last_seen > previous.last_seen;
+    if (previous && !hasNewEvidence && !retryIsDue(previous, now)) {
+      results.push(previous);
+      continue;
+    }
+    const base = {
+      ...group,
+      last_attempt_at: new Date(now).toISOString(),
+      backfill_status: 'not_applicable',
+    };
+    if (previous?.status === 'accepted' && trackedBoards.has(portalBoardKey(previous))) {
+      results.push({
+        ...previous,
+        preferred_name: group.preferred_name,
+        first_seen: previous.first_seen || group.first_seen,
+        last_seen: group.last_seen,
+        source_count: group.source_count,
+        evidence: group.evidence || previous.evidence,
+      });
+      continue;
+    }
+    if (trackedNames.has(group.normalized_lead)) {
+      results.push({ ...base, status: 'already_tracked', reason: 'company name is already tracked' });
+      continue;
+    }
+
+    const dol = joinLeadToDol({ source_company: group.preferred_name }, employers);
+    if (dol.status !== 'dol_accepted') {
+      results.push({
+        ...base,
+        ...dol,
+        normalized_lead: group.normalized_lead,
+        preferred_name: group.preferred_name,
+        first_seen: group.first_seen,
+        last_seen: group.last_seen,
+        source_count: group.source_count,
+        evidence: group.evidence,
+        next_retry_at: dol.status === 'dol_ambiguous'
+          ? nextRetryAt(now, { days: unresolvedDays })
+          : '',
+      });
+      continue;
+    }
+
+    const matchedCandidates = findAtsCandidatesForDol(dol, candidates)
+      .sort((left, right) => Number(right.job_count || 0) - Number(left.job_count || 0));
+    const trackedCandidate = matchedCandidates.find(candidate => trackedBoards.has(portalBoardKey({
+      provider: candidate.provider,
+      board_identifier: candidate.identifier,
+    })));
+    if (trackedCandidate) {
+      results.push({
+        ...base,
+        ...dol,
+        normalized_lead: group.normalized_lead,
+        preferred_name: group.preferred_name,
+        status: 'already_tracked',
+        provider: trackedCandidate.provider,
+        board_identifier: trackedCandidate.identifier,
+        careers_url: trackedCandidate.careers_url,
+        reason: 'verified ATS board is already tracked',
+      });
+      continue;
+    }
+    if (!matchedCandidates.length) {
+      results.push({
+        ...base,
+        ...dol,
+        normalized_lead: group.normalized_lead,
+        preferred_name: group.preferred_name,
+        status: 'ats_unresolved',
+        next_retry_at: nextRetryAt(now, { days: unresolvedDays }),
+        reason: 'no live exact public ATS candidate; bounded Google resolution is required',
+      });
+      continue;
+    }
+
+    const evaluated = [];
+    for (const candidate of matchedCandidates) {
+      evaluated.push(await evaluateCandidate(dol, candidate, { reviews }));
+    }
+    const accepted = evaluated.find(isScannableAdmission);
+    if (accepted) {
+      results.push(preserveBackfill({
+        ...base,
+        ...accepted,
+        normalized_lead: group.normalized_lead,
+        preferred_name: group.preferred_name,
+        first_seen: group.first_seen,
+        last_seen: group.last_seen,
+        source_count: group.source_count,
+        evidence: accepted.evidence || group.evidence,
+        next_retry_at: '',
+      }, previous, now, backfillDays));
+      continue;
+    }
+
+    const chosen = evaluated.find(row => row.status === 'identity_review')
+      || evaluated.find(row => row.status === 'verification_error')
+      || evaluated[0];
+    results.push({
+      ...base,
+      ...chosen,
+      normalized_lead: group.normalized_lead,
+      preferred_name: group.preferred_name,
+      first_seen: group.first_seen,
+      last_seen: group.last_seen,
+      source_count: group.source_count,
+      next_retry_at: nextRetryAt(now, chosen.status === 'verification_error'
+        ? { minutes: transientMinutes }
+        : { days: unresolvedDays }),
+    });
+  }
+
+  return results.sort((left, right) => left.normalized_lead.localeCompare(right.normalized_lead));
+}
+
+function readYaml(path) {
+  return yaml.load(readFileSync(path, 'utf8')) || {};
+}
+
+function dataPath(dataRoot, value) {
+  return resolve(dataRoot, clean(value));
+}
+
+function statusCounts(rows) {
+  const counts = {};
+  for (const row of rows) counts[row.status] = (counts[row.status] || 0) + 1;
+  return counts;
+}
+
+function writeJsonReceipt(paths, prefix, body, now = new Date()) {
+  mkdirSync(paths.receipts, { recursive: true });
+  const timestamp = new Date(now).toISOString().replace(/[:.]/g, '-');
+  const path = join(paths.receipts, `${prefix}-${timestamp}-${randomUUID().slice(0, 8)}.json`);
+  writeFileSync(path, `${JSON.stringify(body, null, 2)}\n`, 'utf8');
+  return path;
+}
+
+function writeReviewQueue(paths, scope, rows, now = new Date()) {
+  const reviewRows = rows.filter(row => ['dol_ambiguous', 'identity_review'].includes(row.status));
+  if (!reviewRows.length) return '';
+  const day = new Date(now).toISOString().slice(0, 10);
+  const path = join(paths.root, `profiles/sunny-company-review-queue-${scope}-${day}.yml`);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, yaml.dump({
+    schema_version: 1,
+    generated_at: new Date(now).toISOString(),
+    scope,
+    reviews: reviewRows.map(row => ({
+      source_brand: row.preferred_name,
+      status: row.status,
+      dol_legal_name: row.dol_legal_name || '',
+      dol_dba: row.dol_dba || '',
+      ats_provider: row.provider || '',
+      board_identifier: row.board_identifier || '',
+      board_owner: row.board_owner || '',
+      careers_url: row.careers_url || '',
+      evidence: row.evidence || '',
+      reason: row.reason || '',
+    })),
+  }, { noRefs: true, lineWidth: -1 }), 'utf8');
+  return path;
+}
+
+export async function runResolution({
+  dataRoot = getCareerOpsRoot(),
+  scope,
+  mode = 'incremental',
+  write = false,
+  now = new Date(),
+} = {}) {
+  if (!['nyc', 'remote'].includes(scope)) throw new Error('scope must be nyc or remote');
+  if (!['backfill', 'incremental'].includes(mode)) throw new Error('mode must be backfill or incremental');
+  const paths = statePaths(dataRoot);
+  const config = readYaml(paths.config);
+  const employers = loadTsv(dataPath(dataRoot, config.dol_employers));
+  const candidates = loadTsv(dataPath(dataRoot, config.ats_candidates));
+  const reviewsDoc = existsSync(paths.reviewsV2) ? readYaml(paths.reviewsV2) : { reviews: [] };
+  if (Number(reviewsDoc.schema_version) !== 2 || !Array.isArray(reviewsDoc.reviews)) {
+    throw new Error('v2 identity review file must have schema_version: 2 and reviews: []');
+  }
+  const portals = readYaml(paths.portals);
+  const leads = readLeadRows({ dataRoot });
+  const currentState = readResolutionRows({ dataRoot });
+  const rows = await resolveCompanyLeads({
+    leads,
+    scope,
+    employers,
+    candidates,
+    portals,
+    reviews: reviewsDoc.reviews,
+    currentState,
+    now,
+    backfillDays: Number(config.scan?.backfill_days || 20),
+    unresolvedDays: Number(config.retry?.unresolved_days || 7),
+    transientMinutes: Number(config.retry?.transient_minutes || 180),
+  });
+
+  await updateResolutionRows(rows, { dataRoot });
+  let portalResult = { added: 0, entries: [] };
+  if (write) {
+    try {
+      portalResult = await commitPortalAdmissions(rows.filter(isScannableAdmission), { dataRoot });
+    } catch (error) {
+      const failedKeys = new Set(rows.filter(isScannableAdmission).map(row => row.normalized_lead));
+      await updateResolutionRows(current => current.map(row => (
+        failedKeys.has(row.normalized_lead) ? {
+          ...row,
+          status: 'verification_error',
+          backfill_status: 'retry_error',
+          backfill_error: `portal commit failed: ${clean(error?.message || error)}`,
+          next_retry_at: nextRetryAt(now, { minutes: Number(config.retry?.transient_minutes || 180) }),
+        } : row
+      )), { dataRoot });
+      throw error;
+    }
+  }
+
+  const reviewQueue = writeReviewQueue(paths, scope, rows, now);
+  const body = {
+    schema_version: 1,
+    command: 'resolve',
+    scope,
+    mode,
+    dry_run: !write,
+    lead_rows_in_scope: leads.filter(row => row.scope === scope).length,
+    companies_resolved: rows.length,
+    outcomes: statusCounts(rows),
+    portal_additions: portalResult.added,
+    review_queue: reviewQueue,
+    completed_at: new Date(now).toISOString(),
+  };
+  const receiptPath = writeJsonReceipt(paths, `company-${scope}-${mode}`, body, now);
+  return { ...body, receipt_path: receiptPath };
+}
+
+export function isInsidePreNoonGuard(now = new Date(), guardMinutes = 30) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date(now));
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  const minuteOfDay = Number(values.hour) * 60 + Number(values.minute);
+  return minuteOfDay >= 12 * 60 - Number(guardMinutes) && minuteOfDay < 12 * 60;
+}
+
+export async function runPendingBackfills({
+  dataRoot = getCareerOpsRoot(),
+  now = new Date(),
+  ignoreGuard = false,
+} = {}) {
+  const paths = statePaths(dataRoot);
+  const config = readYaml(paths.config);
+  const guardMinutes = Number(config.scan?.pre_noon_guard_minutes || 30);
+  if (!ignoreGuard && isInsidePreNoonGuard(now, guardMinutes)) {
+    return { started: 0, complete: 0, partial: 0, error: 0, deferred_pre_noon: true };
+  }
+  const attempted = new Set();
+  const totals = { started: 0, complete: 0, partial: 0, error: 0, deferred_pre_noon: false };
+  const { runSerializedScan } = await import('./run-sunny-serialized-scan.mjs');
+
+  for (;;) {
+    let claimed = null;
+    await updateResolutionRows(current => current.map(row => {
+      const eligible = row.status === 'accepted'
+        && ['pending', 'retry_error', 'retry_partial'].includes(row.backfill_status)
+        && !attempted.has(row.normalized_lead);
+      if (!eligible || claimed) return row;
+      claimed = startBackfill(row, now, Number(config.scan?.backfill_days || 20));
+      return claimed;
+    }), { dataRoot });
+    if (!claimed) break;
+    attempted.add(claimed.normalized_lead);
+    totals.started += 1;
+
+    let scanResult;
+    try {
+      scanResult = await runSerializedScan({
+        kind: 'backfill',
+        dataRoot,
+        provider: claimed.provider,
+        boardIdentifier: claimed.board_identifier,
+        postedAfter: claimed.backfill_window_start,
+        postedBefore: claimed.backfill_window_end,
+      });
+    } catch (error) {
+      scanResult = { completion_status: 'error', error: clean(error?.message || error) };
+    }
+    const completion = scanResult.completion_status || 'error';
+    totals[completion] += 1;
+    await updateResolutionRows(current => current.map(row => (
+      row.normalized_lead === claimed.normalized_lead
+        && portalBoardKey(row) === portalBoardKey(claimed)
+        ? finishBackfill(row, {
+          status: completion,
+          error: scanResult.error || scanResult.warnings?.join('; ') || '',
+        })
+        : row
+    )), { dataRoot });
+  }
+  return totals;
+}
+
+async function runIngestCommand(args, dataRoot = getCareerOpsRoot()) {
+  const inputPath = resolve(args.input);
+  const payload = JSON.parse(readFileSync(inputPath, 'utf8'));
+  const rows = Array.isArray(payload) ? payload : payload.jobs || payload.results;
+  if (!Array.isArray(rows)) throw new Error('ingest JSON must be an array or contain jobs/results array');
+  const runId = clean(payload.run_id) || `${args.source}-${args.scope}-${new Date().toISOString()}`;
+  const result = await ingestLeadRows(rows, {
+    dataRoot,
+    source: args.source,
+    scope: args.scope,
+    runId,
+  });
+  const paths = statePaths(dataRoot);
+  const receipt = {
+    schema_version: 1,
+    command: 'ingest',
+    source: args.source,
+    scope: args.scope,
+    input: inputPath,
+    ...result,
+  };
+  return { ...receipt, receipt_path: writeJsonReceipt(paths, `ingest-${args.source}-${args.scope}`, receipt) };
+}
+
+async function main(argv = process.argv.slice(2)) {
+  const args = parseArgs(argv);
+  let result;
+  if (args.command === 'ingest') result = await runIngestCommand(args);
+  else if (args.command === 'backfill') result = await runPendingBackfills();
+  else result = await runResolution({
+    scope: args.scope,
+    mode: args.mode || 'incremental',
+    write: args.write,
+  });
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+}
+
+if (isMainModule(import.meta.url)) {
+  main().catch(error => {
+    console.error(`Error: ${error.message}`);
+    process.exitCode = 1;
   });
 }

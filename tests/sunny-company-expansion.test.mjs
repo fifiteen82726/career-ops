@@ -10,9 +10,21 @@ import {
   evaluateAtsCandidate,
   isScannableAdmission,
   joinLeadToDol,
+  parseArgs,
   portalBoardKey,
+  resolveCompanyLeads,
   validateV2Review,
 } from '../data/tools/sunny-company-expansion.mjs';
+
+test('CLI requires exactly one supported scope and run mode', () => {
+  assert.deepEqual(
+    parseArgs(['run', '--scope', 'nyc', '--mode', 'incremental']),
+    { command: 'run', scope: 'nyc', mode: 'incremental', dryRun: true, write: false },
+  );
+  assert.throws(() => parseArgs(['run', '--scope', 'all', '--mode', 'incremental']), /nyc or remote/);
+  assert.throws(() => parseArgs(['run', '--scope', 'nyc', '--mode', 'weekly']), /backfill or incremental/);
+  assert.throws(() => parseArgs(['resolve', '--scope', 'nyc', '--scope', 'remote']), /exactly one --scope/);
+});
 
 const employers = [{
   EMPLOYER_NAME: 'Example Holdings, Inc.',
@@ -117,6 +129,67 @@ test('published ATS owner must match an accepted brand or DOL identity', async (
   assert.equal(accepted.identity_status, 'owner_verified');
   assert.equal(mismatch.status, 'identity_review');
   assert.equal(isScannableAdmission(mismatch), false);
+});
+
+test('resolution groups leads, skips tracked companies, and anchors accepted backfills', async () => {
+  const leads = [
+    {
+      source_company: 'Example', normalized_source_company: 'example', source: 'linkedin', scope: 'nyc',
+      discovered_at: '2026-09-08T10:00:00Z', job_url: 'https://linkedin.com/jobs/view/1',
+    },
+    {
+      source_company: 'Example', normalized_source_company: 'example', source: 'builtin', scope: 'nyc',
+      discovered_at: '2026-09-08T11:00:00Z', job_url: 'https://builtinnyc.com/job/2',
+    },
+    {
+      source_company: 'Existing', normalized_source_company: 'existing', source: 'indeed', scope: 'nyc',
+      discovered_at: '2026-09-08T11:30:00Z', job_url: 'https://indeed.com/viewjob?jk=3',
+    },
+    {
+      source_company: 'Unknown', normalized_source_company: 'unknown', source: 'indeed', scope: 'nyc',
+      discovered_at: '2026-09-08T11:45:00Z', job_url: 'https://indeed.com/viewjob?jk=4',
+    },
+  ];
+  const candidates = [{
+    employer_name: 'Example Holdings, Inc.',
+    dba: 'Example',
+    provider: 'greenhouse',
+    identifier: 'example',
+    verification: 'live',
+    careers_url: 'https://job-boards.greenhouse.io/example',
+    job_count: '7',
+    match_status: 'candidate',
+  }];
+  const rows = await resolveCompanyLeads({
+    leads,
+    scope: 'nyc',
+    employers,
+    candidates,
+    portals: {
+      tracked_companies: [{
+        name: 'Existing', provider: 'greenhouse', careers_url: 'https://job-boards.greenhouse.io/existing',
+      }],
+    },
+    reviews: [],
+    now: new Date('2026-09-08T14:00:00Z'),
+    evaluateCandidate: async (dolMatch, candidate) => ({
+      ...dolMatch,
+      status: 'accepted',
+      provider: candidate.provider,
+      board_identifier: candidate.identifier,
+      careers_url: candidate.careers_url,
+      health_status: 'live',
+      identity_status: 'owner_verified',
+      board_owner: 'Example',
+    }),
+  });
+
+  assert.deepEqual(rows.map(row => row.status).sort(), ['accepted', 'already_tracked', 'dol_rejected']);
+  const accepted = rows.find(row => row.status === 'accepted');
+  assert.equal(accepted.source_count, 2);
+  assert.equal(accepted.backfill_status, 'pending');
+  assert.equal(accepted.backfill_window_start, '2026-08-20');
+  assert.equal(accepted.backfill_window_end, '2026-09-08');
 });
 
 test('portal board identity is exact, so clear never collides with clearstreet', () => {
