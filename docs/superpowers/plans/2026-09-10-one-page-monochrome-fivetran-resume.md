@@ -15,7 +15,7 @@
 **Files:**
 - Modify: `modes/_custom.md`
 
-- [ ] **Step 1: Add the durable resume-format rules**
+- [x] **Step 1: Add the durable resume-format rules**
 
 Append these rules under `## House Rules`:
 
@@ -26,7 +26,7 @@ Append these rules under `## House Rules`:
 - Keep Technical Skills as the final resume section.
 ```
 
-- [ ] **Step 2: Verify the rules are present once**
+- [x] **Step 2: Verify the rules are present once**
 
 Run:
 
@@ -36,16 +36,15 @@ rg -n "one US Letter page|Core Competencies|Technical Skills as the final" modes
 
 Expected: one match for each new rule and no duplicate block.
 
-- [ ] **Step 3: Commit the persistent preference update**
+- [x] **Step 3: Preserve the user-layer privacy boundary**
 
 Run:
 
 ```bash
-git add modes/_custom.md
-git commit -m "chore: persist one-page resume preferences"
+git check-ignore -v modes/_custom.md
 ```
 
-Expected: one commit containing only `modes/_custom.md`.
+Expected: `.gitignore` identifies `modes/_custom.md` as user-layer data. Keep it local and do not force-add it.
 
 ### Task 2: Create the compact tailored resume sources
 
@@ -53,7 +52,7 @@ Expected: one commit containing only `modes/_custom.md`.
 - Create: `output/cv-yi-yun-liao-fivetran-senior-data-analyst-one-page.md`
 - Create: `output/cv-yi-yun-liao-fivetran-senior-data-analyst-one-page.json`
 
-- [ ] **Step 1: Write the Markdown resume mirror**
+- [x] **Step 1: Write the Markdown resume mirror**
 
 Write this exact source, using ASCII hyphens for date ranges:
 
@@ -116,7 +115,7 @@ Taipei, Taiwan | August 2020 - January 2021
 - **BI, cloud, and tools:** Tableau, Power BI, Looker, Excel, Google Sheets, Azure, AWS, GCP, Git
 ```
 
-- [ ] **Step 2: Write the renderer payload**
+- [x] **Step 2: Write the renderer payload**
 
 Create this exact JSON payload, matching the Markdown content:
 
@@ -224,7 +223,7 @@ Create this exact JSON payload, matching the Markdown content:
 
 Do not include a `competencies` key.
 
-- [ ] **Step 3: Check structure, language, and prohibited content**
+- [x] **Step 3: Check structure, language, and prohibited content**
 
 Run:
 
@@ -241,7 +240,7 @@ Expected: `jq` prints `true`; `rg` exits with no matches.
 - Create: `output/cv-template-monochrome-one-page.html`
 - Create: `output/cv-yi-yun-liao-fivetran-senior-data-analyst-one-page.html`
 
-- [ ] **Step 1: Create the semantic one-column template**
+- [x] **Step 1: Create the semantic one-column template**
 
 Write this exact one-column template. It intentionally omits every competency, image, gradient, sidebar, and icon placeholder:
 
@@ -271,8 +270,8 @@ Write this exact one-column template. It intentionally omits every competency, i
       background: var(--paper);
       color: var(--ink);
       font-family: Arial, Helvetica, sans-serif;
-      font-size: 9.35pt;
-      line-height: 1.27;
+      font-size: 10.4pt;
+      line-height: 1.32;
       -webkit-print-color-adjust: exact;
       print-color-adjust: exact;
     }
@@ -280,12 +279,12 @@ Write this exact one-column template. It intentionally omits every competency, i
     .page {
       width: {{PAGE_WIDTH}};
       min-height: 11in;
-      padding: 0.42in 0.55in 0.38in;
+      padding: 0.48in 0.58in 0.44in;
       background: var(--paper);
       color: var(--ink);
     }
 
-    header {
+    .header {
       text-align: center;
       padding-bottom: 2px;
     }
@@ -293,7 +292,7 @@ Write this exact one-column template. It intentionally omits every competency, i
     h1 {
       margin: 0 0 3px;
       color: var(--ink);
-      font-size: 21px;
+      font-size: 22px;
       line-height: 1.05;
       letter-spacing: 0.01em;
       font-weight: 700;
@@ -312,20 +311,20 @@ Write this exact one-column template. It intentionally omits every competency, i
       flex-wrap: wrap;
       gap: 0 5px;
       color: var(--ink);
-      font-size: 8.7pt;
+      font-size: 9.3pt;
       line-height: 1.2;
     }
 
     .separator { color: var(--ink); }
 
-    .section { margin-top: 6px; }
+    .section { margin-top: 8px; }
 
     .section-title {
-      margin: 0 0 3px;
-      padding: 0 0 2px;
+      margin: 0 0 4px;
+      padding: 0 0 2.5px;
       border-bottom: 1px solid var(--ink);
       color: var(--ink);
-      font-size: 10.2pt;
+      font-size: 10.7pt;
       line-height: 1.1;
       font-weight: 700;
       letter-spacing: 0.055em;
@@ -335,13 +334,13 @@ Write this exact one-column template. It intentionally omits every competency, i
     .summary-text {
       margin: 0;
       color: var(--ink);
-      line-height: 1.3;
+      line-height: 1.34;
     }
 
     strong { font-weight: 700; }
 
     .job {
-      margin: 0 0 4px;
+      margin: 0 0 6px;
       break-inside: avoid;
       page-break-inside: avoid;
     }
@@ -360,12 +359,12 @@ Write this exact one-column template. It intentionally omits every competency, i
       font-weight: 700;
     }
 
-    .job-company { font-size: 9.8pt; }
+    .job-company { font-size: 10.4pt; }
 
     .job-period,
     .edu-year {
       color: var(--ink);
-      font-size: 8.6pt;
+      font-size: 9.2pt;
       white-space: nowrap;
     }
 
@@ -373,8 +372,8 @@ Write this exact one-column template. It intentionally omits every competency, i
     .job-location {
       display: inline;
       color: var(--ink);
-      font-size: 8.8pt;
-      line-height: 1.15;
+      font-size: 9.4pt;
+      line-height: 1.18;
     }
 
     .job-role {
@@ -385,35 +384,37 @@ Write this exact one-column template. It intentionally omits every competency, i
     .job-location::before { content: " | "; }
 
     ul {
-      margin: 1px 0 0 13px;
+      margin: 2px 0 0 14px;
       padding: 0;
     }
 
     li {
-      margin: 0 0 1.25px;
+      margin: 0 0 2px;
       padding-left: 1px;
     }
 
     .edu-item {
-      margin: 0 0 2px;
+      margin: 0 0 3px;
       break-inside: avoid;
       page-break-inside: avoid;
     }
 
-    .edu-title { font-size: 8.95pt; }
+    .edu-title { font-size: 9pt; }
 
     .edu-org {
       color: var(--ink);
       font-weight: 400;
     }
 
+    .edu-org::before { content: " | "; }
+
     .skills-grid { margin: 0; }
 
     .skill-item {
       margin: 0 0 1px;
       color: var(--ink);
-      font-size: 8.75pt;
-      line-height: 1.22;
+      font-size: 9.2pt;
+      line-height: 1.25;
     }
 
     .skill-category {
@@ -424,12 +425,12 @@ Write this exact one-column template. It intentionally omits every competency, i
 </head>
 <body>
   <div class="page">
-    <header>
+    <div class="header">
       <h1>{{NAME}}</h1>
       <div class="contact-row">
         <span>contact</span>
       </div>
-    </header>
+    </div>
 
     <main>
       <section class="section">
@@ -457,7 +458,7 @@ Write this exact one-column template. It intentionally omits every competency, i
 </html>
 ```
 
-- [ ] **Step 2: Build the final HTML from JSON**
+- [x] **Step 2: Build the final HTML from JSON**
 
 Run:
 
@@ -470,7 +471,7 @@ node build-cv-html.mjs \
 
 Expected: JSON report with `valid: true`, five experience entries, two education entries, ten bullets, and zero competencies.
 
-- [ ] **Step 3: Run source-of-truth and ATS checks**
+- [x] **Step 3: Run source-of-truth and ATS checks**
 
 Run:
 
@@ -484,7 +485,7 @@ node verify-ats.mjs output/cv-yi-yun-liao-fivetran-senior-data-analyst-one-page.
 
 Expected: no unsupported claim; ATS score at least 85 with no critical issue.
 
-- [ ] **Step 4: Check structural and visual constraints in source**
+- [x] **Step 4: Check structural and visual constraints in source**
 
 Run:
 
@@ -501,7 +502,7 @@ Expected: both checks exit zero.
 - Create: `output/cv-yi-yun-liao-fivetran-senior-data-analyst-one-page-2026-09-10.pdf`
 - Create temporarily: `tmp/pdfs/fivetran-one-page-1.png`
 
-- [ ] **Step 1: Register the PDF authoring operation once**
+- [x] **Step 1: Register the PDF authoring operation once**
 
 Run exactly once before rendering:
 
@@ -512,7 +513,7 @@ node /Users/coda/.codex/plugins/cache/openai-primary-runtime/pdf/26.904.11930/sk
 
 Expected: successful registration.
 
-- [ ] **Step 2: Render with a strict one-page budget**
+- [x] **Step 2: Render with a strict one-page budget**
 
 Run:
 
@@ -525,7 +526,7 @@ node generate-pdf.mjs \
 
 Expected: `Pages: 1` and a successful PDF path.
 
-- [ ] **Step 3: Verify PDF geometry, text, and lack of images**
+- [x] **Step 3: Verify PDF geometry, text, and lack of images**
 
 Run:
 
@@ -537,7 +538,7 @@ pdfimages -list output/cv-yi-yun-liao-fivetran-senior-data-analyst-one-page-2026
 
 Expected: one 612 x 792 pt page, complete selectable text, Technical Skills last, and no embedded raster images.
 
-- [ ] **Step 4: Render a QA image and inspect it**
+- [x] **Step 4: Render a QA image and inspect it**
 
 Run:
 
@@ -550,7 +551,7 @@ pdftoppm -png -r 150 -f 1 -singlefile \
 
 Inspect `tmp/pdfs/fivetran-one-page.png` at full-page and original resolution. Check black-only styling, readable type, consistent alignment and spacing, no collisions or clipping, no awkward orphan lines, and a balanced bottom margin. If any defect appears, edit the source or template, rebuild, rerender, and repeat all checks.
 
-- [ ] **Step 5: Confirm protected sources and final artifact set**
+- [x] **Step 5: Confirm protected sources and final artifact set**
 
 Run:
 
