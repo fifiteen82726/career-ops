@@ -482,7 +482,13 @@ function boundedProbeCtx(base) {
     return fn(url, opts);
   };
   return {
-    ctx: { ...base, maxPages: 1, fetchJson: guard(base.fetchJson), fetchText: guard(base.fetchText) },
+    ctx: {
+      ...base,
+      maxPages: 1,
+      fetchJson: guard(base.fetchJson),
+      fetchText: guard(base.fetchText),
+      ...(typeof base.fetchResponse === 'function' ? { fetchResponse: guard(base.fetchResponse) } : {}),
+    },
     wasTripped: () => tripped,
   };
 }

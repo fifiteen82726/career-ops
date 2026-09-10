@@ -11,6 +11,9 @@ import {
   runSerializedScan,
   withSunnyScanLock,
 } from '../data/tools/run-sunny-serialized-scan.mjs';
+import { readPendingJobs } from '../data/tools/sunny-job-queue.mjs';
+
+const validReceipt = { version: 'careerops.scan.receipt@1', errors: [], added_urls: [] };
 
 const fullConfig = {
   title_filter: { positive: ['word:data'] },
@@ -79,17 +82,27 @@ test('two Sunny scan runs never overlap their critical section', async (t) => {
 });
 
 test('partial and error scans cannot complete an anchored backfill', () => {
-  assert.equal(classifyScanCompletion({ exitCode: 0, stderr: '', receipt: { errors: [] } }), 'complete');
+  assert.equal(classifyScanCompletion({ exitCode: 0, stderr: '', receipt: validReceipt }), 'complete');
   assert.equal(classifyScanCompletion({
     exitCode: 0,
     stderr: 'workday: Example truncated at max_pages=100',
-    receipt: { errors: [] },
+    receipt: validReceipt,
   }), 'partial');
   assert.equal(classifyScanCompletion({
     exitCode: 2,
     stderr: '',
-    receipt: { errors: [{ company: 'Example', error: 'HTTP 503' }] },
+    receipt: { ...validReceipt, errors: [{ company: 'Example', error: 'HTTP 503' }] },
   }), 'error');
+});
+
+test('missing receipt is an error and errors take precedence over partial warnings', () => {
+  assert.equal(classifyScanCompletion({ exitCode: 0, receipt: null }), 'error');
+  assert.equal(classifyScanCompletion({ exitCode: 0, receipt: {} }), 'error');
+  assert.equal(classifyScanCompletion({ exitCode: 0, receipt: { errors: [] } }), 'error');
+  assert.equal(classifyScanCompletion({ exitCode: null, receipt: validReceipt }), 'error');
+  assert.equal(classifyScanCompletion({ exitCode: 2, stderr: 'partial board', receipt: validReceipt }), 'error');
+  assert.equal(classifyScanCompletion({ exitCode: 0, receipt: { ...validReceipt, partial_boards: ['Example'] } }), 'partial');
+  assert.equal(classifyScanCompletion({ exitCode: 0, receipt: { ...validReceipt, skipped: 2 } }), 'partial');
 });
 
 test('backfill receipt is bound to the exact provider and board identifier', async (t) => {
@@ -115,7 +128,7 @@ test('backfill receipt is bound to the exact provider and board identifier', asy
       ]);
       return {
         exitCode: 0,
-        stdout: JSON.stringify({ version: 'careerops.scan.receipt@1', errors: [], added: 0 }),
+        stdout: JSON.stringify({ ...validReceipt, added: 1, added_urls: ['https://example.com/jobs/1'] }),
         stderr: '',
       };
     },
@@ -127,4 +140,5 @@ test('backfill receipt is bound to the exact provider and board identifier', asy
   assert.equal(result.posted_after, '2026-08-20');
   assert.equal(result.posted_before, '2026-09-08');
   assert.match(result.receipt_path, /data\/company-discovery\/receipts\//);
+  assert.equal(readPendingJobs({ dataRoot }).length, 1, 'wrapper persists added URLs, not just a receipt');
 });

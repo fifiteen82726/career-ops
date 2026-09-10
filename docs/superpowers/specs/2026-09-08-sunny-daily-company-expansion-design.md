@@ -4,6 +4,12 @@
 **Status:** Approved for implementation after independent review
 **Scope:** Company discovery and ATS admission for Sunny's Greater New York and U.S.-remote job search
 
+## 2026-09-09 reviewed amendment — supersedes the original Q3-only gate below
+
+The active evidence index is now `profiles/sunny-company-discovery.yml`'s validated eight-quarter index, FY2024 Q4 through FY2026 Q3. Tier A has positive CHANGE_EMPLOYER in the current disclosure; Tier B has it only in the earlier part of the window. Both are historical evidence, not current-job transfer guarantees. Case-number dedup, observed-quarter validation and exact legal/DBA collision checks apply before admission. Original Q3 counts below describe the design's earlier baseline only.
+
+State is keyed by company + provider + board, not company alone. Each board needs independent identity verification; aliases of an identical board share anchored backfill completion. Known identity holds override matching owner names. Offline ATS datasets supply hints, not permission to append: use the bounded reviewed probe/resolver and staged portal validation/CAS. All scan candidates survive in the shared durable job queue until a verified disposition; scan history is not publication state. Current implementation and operational acceptance gates are tracked in `docs/superpowers/plans/2026-09-08-sunny-coverage-recovery.md` and `modes/_custom.md`.
+
 ## Problem
 
 Sunny's daily job scan can only inspect companies already represented in `portals.yml`. The current pool is large, but public ATS directories, legal-employer names, hiring brands, and current job-market sources do not line up perfectly. A company may have certified FY2026 Q3 H-1B `CHANGE_EMPLOYER` filings and a relevant New York or U.S.-remote opening while still being absent because its legal name, brand, parent, or ATS owner differs.
@@ -21,7 +27,7 @@ Company discovery and job processing therefore need separate state and responsib
 ## Non-goals
 
 - Preloading every one of the 17,495 national FY2026 Q3 H-1B employers.
-- Treating Indeed's `sponsored` field, a LinkedIn sponsor badge, company size, PERM history, or an old LCA job title as an admission gate.
+- Treating Indeed's `sponsored` field, an aggregator sponsor badge, company size, PERM history, or an old LCA job title as an admission gate.
 - Automatically resolving ambiguous parent/subsidiary or brand/legal-entity relationships without evidence.
 - Scraping application forms, applying to jobs, or messaging contacts.
 - Replacing the existing daily job scoring and Google Sheet schema.
@@ -67,16 +73,22 @@ All source output is untrusted external data and can create only a lead.
 2. **Indeed U.S. remote:** a separate `remote_only: true` pass.
 3. **Built In NYC:** the existing Built In NYC provider.
 4. **Built In remote:** the existing national remote provider.
-5. **LinkedIn NYC Metro:** location-scoped jobs, sorted by date.
-6. **LinkedIn U.S. remote:** a separate location-scoped remote search.
-7. **Google:** bounded resolution queries only for a new DOL-approved company whose official ATS remains unknown. Google is not rerun globally every day.
+5. **freehire NYC Metro:** keyless public API, `us-h1b-sponsor` collection, first-party ATS rows only, limited to New York City, Jersey City, and Newark.
+6. **freehire U.S. remote:** the same first-party ATS boundary, limited to U.S. remote jobs.
+7. **Himalayas U.S. remote:** public API searched through bounded high-recall data/analyst query pages.
+8. **Jobicy U.S. remote:** public API with `geo=usa`, `tag=data`, and the documented 200-row request ceiling.
+9. **OpenJobs and public ATS directories:** offline company/board candidates, including BambooHR, Paylocity, Recruitee, Breezy, Teamtailor, Personio, Rippling, and Jobvite tenants omitted by the original five-provider sweep. Greenhouse, Ashby, Lever, Workday, and iCIMS directories are also processed owner-first: the ATS-published owner is joined to DOL before checking for a current first-party job, so non-obvious board slugs are recoverable without fuzzy identity guesses.
+10. **The Muse NYC and U.S. remote:** keyless public jobs API, paginated independently for each scope and used as a company-lead source only.
+11. **Open Jobs Fleet:** daily CC0 exports of live ATS boards across 36 providers. High-confidence company identities are company leads only; DOL, first-party ATS owner, and active-board verification still gate admission.
+12. **newgrad-jobs / JobRight:** the public U.S. Data Analyst and Data Engineer dashboards (`?k=da` and `?k=de`) are read through their embedded structured JobRight feed. Rows explicitly marked `H1b Sponsored: No` are discarded; NYC Metro and U.S.-remote scope filters are applied before ingestion. This is company-lead evidence only, never ATS-owner or H-1B proof.
+13. **Google:** bounded resolution queries only for a new DOL-approved company whose official ATS remains unknown. Google is not rerun globally every day.
 
 Indeed's one-location-per-reply constraint is honored by running NYC and remote in two independent automation turns, not merely two calls in one turn. Connector failures are recorded per source. A successful source returning zero leads is distinct from a failed or truncated source.
 
 Each source turn has an explicit mode:
 
-- **`backfill`:** used for the first implementation run or an intentional historical refresh. LinkedIn uses `past_month`, then locally retains only jobs whose available `posted_at` falls within the anchored 20-day source window. Built In uses bounded historical pagination and the same local cutoff. Indeed has no equivalent date argument, so it returns its available ranked results; dates are retained when supplied and no unsupported 20-day completeness claim is made for undated results.
-- **`incremental`:** used by the daily automations. LinkedIn uses `past_24_hours`; Built In and Indeed rerun their bounded current searches and rely on the source-lead ledger to retain only unseen lead keys.
+- **`backfill`:** used for the first implementation run or an intentional historical refresh. freehire walks bounded pages of live first-party ATS jobs; Himalayas walks bounded query pages; Jobicy requests its current 200-row U.S.-data feed. Built In uses bounded historical pagination and the same local cutoff. Indeed has no equivalent date argument, so it returns its available ranked results; dates are retained when supplied and no unsupported completeness claim is made for undated results.
+- **`incremental`:** used by the daily automations. freehire restricts to jobs first observed by that source within three days; Built In, Indeed, The Muse, newgrad-jobs/JobRight, Himalayas, and Jobicy rerun bounded current searches and rely on the source-lead ledger to retain only unseen lead keys.
 
 Run receipts name the mode and the effective date capability of each source. A source backfill is never described as complete when that connector does not expose a reliable posting date or exhaustive pagination.
 
@@ -110,7 +122,7 @@ The code root is used only to locate shipped executable dependencies. No impleme
 
 ### Connector ingestion contract
 
-Indeed and LinkedIn remain connector calls made by the automation agent; credentials and private session state never enter a local script. Their returned job objects are converted into the same compact lead schema and passed to a local ingestion command through a dated JSON input artifact under `{DATA_ROOT}/data/company-discovery/inbox/`. The ingestion command accepts exactly one `source` and one `scope` per invocation, validates every record, appends only new lead keys, and reports rejected malformed rows. Built In results enter through the same ingestion boundary even though they are collected by a local provider.
+Indeed remains a connector call made by the automation agent; credentials and private session state never enter a local script. The Muse, newgrad-jobs/JobRight, freehire, Himalayas, Jobicy, OpenJobs, Built In, Paylocity, BambooHR, and public ATS owner directories use public or offline collectors. Every source is converted into the same compact lead schema and passed to a local ingestion command through a dated JSON input artifact under `{DATA_ROOT}/data/company-discovery/inbox/`. The ingestion command accepts exactly one `source` and one `scope` per invocation, validates every record, appends only new lead keys, and reports rejected malformed rows.
 
 This boundary lets company resolution run deterministically from saved inputs, makes connector failures replayable without re-querying the service, and prevents connector-specific fields such as Indeed's promotional `sponsored` flag from leaking into H-1B decisions.
 
@@ -204,7 +216,8 @@ Historical LCA role titles affect priority only and never reject the company. Me
 ### Stage 3: ATS identity gate
 
 - **Greenhouse, Ashby, Lever:** the live board must publish an owner whose canonical identity matches the accepted company/brand identity.
-- **Workday and other ATS providers:** the board must be linked from an official careers page or be covered by an accepted alias review.
+- **Workday, iCIMS, Paylocity, Paycom, UKG/UltiPro, Dayforce, BambooHR, SmartRecruiters, Gem, and Workable:** use the provider's official owner endpoint, page metadata, or first-job structured hiring-organization data and require an exact accepted DOL/DBA identity.
+- **Other ATS providers:** the board must be linked from an official careers page or be covered by an accepted v2 alias review.
 - **Custom official careers search:** first-party careers URLs are retained as resolution evidence, but a company without a supported scannable provider remains `official_careers_only` and is not appended to `portals.yml`. Building a persistent bounded websearch collector is a separate future feature.
 - **Health:** only live or explicitly partial/truncated boards are admitted. Dead boards are rejected. Transient timeouts remain retryable and are never treated as proof of no jobs.
 
@@ -228,8 +241,8 @@ The lock records run ID, scan kind, start time, and process identity and support
 
 Company discovery and job scanning use three independent, staggered automations:
 
-1. **NYC company discovery turn:** Built In NYC, Indeed `New York, NY` within 50 miles, LinkedIn NYC Metro, then bounded Google resolution for only new DOL-approved NYC leads.
-2. **U.S.-remote company discovery turn:** Built In remote, Indeed `remote_only: true`, LinkedIn U.S.-remote, then bounded Google resolution for only new DOL-approved remote leads.
+1. **NYC company discovery turn:** Built In NYC, Indeed `New York, NY` within 50 miles, The Muse NYC, newgrad-jobs/JobRight NYC Metro, freehire NYC Metro, then bounded Google resolution for only new DOL-approved NYC leads.
+2. **U.S.-remote company discovery turn:** Built In remote, Indeed `remote_only: true`, The Muse U.S. remote, newgrad-jobs/JobRight U.S.-remote, freehire U.S.-remote, Himalayas, Jobicy, then bounded Google resolution for only new DOL-approved remote leads.
 3. **Existing noon job-scan turn:** the current 3-day `portals.yml` scan, downstream gates, scoring, and Sheet update.
 
 The two company-discovery automations are separate replies, use different schedule times, and each covers exactly one location scope. They both call the same location-parameterized company-discovery command. Moving company discovery to weekly changes only those two schedules. The noon job automation remains unchanged except that it consumes any portal entries safely committed before it starts.
@@ -237,7 +250,7 @@ The two company-discovery automations are separate replies, use different schedu
 Each company-discovery turn performs these steps:
 
 1. Record source scope, pre-run lead counts, portal checksum, and run ID.
-2. Collect the scope's Built In, Indeed, and LinkedIn leads.
+2. Collect the scope's Built In, Indeed, The Muse, newgrad-jobs/JobRight, freehire, and scope-appropriate Himalayas/Jobicy leads, plus refreshed offline ATS-directory candidates when due.
 3. Normalize genuinely new source-job leads for the company ledger only.
 4. Resolve only new or retry-eligible company identities through the DOL and ATS gates.
 5. Build a proposed `portals.yml` in a temporary file in the same filesystem.
@@ -267,7 +280,7 @@ The company-expansion state lock and Sunny scan-run lock have separate purposes.
 
 ## Backfill and Dedup Semantics
 
-- Initial implementation uses source mode `backfill`: LinkedIn requests `past_month` and is locally cut to 20 days; Built In uses bounded historical pagination; Indeed is retained with an explicit date-coverage limitation. Daily runs use source mode `incremental` and LinkedIn `past_24_hours`.
+- Initial implementation uses source mode `backfill`: freehire walks bounded first-party ATS result pages, Himalayas walks bounded query pages, Jobicy requests its current U.S.-data feed, Built In uses bounded historical pagination, and Indeed is retained with an explicit date-coverage limitation. Daily runs use source mode `incremental`; public owner-directory successes are cached for 30 days and failures use a cooldown so a daily company run does not re-crawl the full universe.
 - Each newly admitted company receives an anchored 20-day ATS backfill. Error or partial results remain retryable against that same window until complete.
 - Existing companies remain on the 3-day overlapping scan.
 - Only ATS backfill and normal ATS scans write `{DATA_ROOT}/data/sunny-scan-history.tsv` and `Seen Jobs`; source discovery never does. Those two scanner paths share history, so the same ATS job cannot appear twice.
@@ -341,7 +354,7 @@ No single count is described as “companies covered” without naming its denom
 ## Rollout
 
 1. Implement deterministic files, Data Root handling, shared state locking, run-level Sunny scan serialization, exact-board backfill selection, and local-source processing first.
-2. Add connector-output ingestion for Indeed and LinkedIn.
+2. Add connector-output ingestion for Indeed and public collectors for The Muse, freehire, Himalayas, Jobicy, OpenJobs, BambooHR, and Paylocity directories.
 3. Run a dry-run backfill and inspect all proposed portal writes.
 4. Run the identity-safe staged write, validate, and rerun for idempotency.
 5. Backfill new companies for 20 days and verify retry state for forced error/partial fixtures.

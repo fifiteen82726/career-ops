@@ -86,6 +86,9 @@
  * @property {string}             [provider]       Explicit provider id — bypasses detect().
  * @property {('http')}           [transport]      Default: 'http'. Reserved for future transports.
  * @property {number}             [max_pages]      Provider-specific pagination cap (avature, workday).
+ * @property {boolean}            [date_early_stop] Workday only: false disables date early-stop and the
+ *                                                 undated-first-page shortcut for boards with unreliable
+ *                                                 ordering. Default: true; caps and downstream date filters remain.
  * @property {string}             [offset_param]   avature only: pins the pagination query key and disables the
  *                                                 provider's jobOffset→offset self-heal. Rarely needed — an
  *                                                 escape hatch for a tenant the auto-switch can't resolve.

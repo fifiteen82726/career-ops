@@ -11,10 +11,9 @@ import { sleep } from './_http.mjs';
 //   GET {origin}/careers/SearchJobs?jobOffset=N
 //
 // returns a server-rendered page of <article class="article--result"> blocks.
-// Avature hard-caps the page at 6 results (a jobRecordsPerPage override is
-// ignored), and paginates via jobOffset in steps of 6 — so this is request-
-// heavy for large boards; max_pages (default 50 → ~300 postings) bounds it and
-// can be raised per entry.
+// Page sizes vary by tenant (e.g. 6 or 10). Advance by the observed number of
+// result rows, not a fixed size. max_pages (default 50) bounds the scan; an
+// incomplete scan emits an explicit warning for callers' partial-run tracking.
 //
 // Pagination parameter name is `jobOffset` on classic tenants, but some branded
 // tenants ignore it and page via a bare `offset` instead (e.g. jobs.siemens.com:
@@ -29,11 +28,10 @@ import { sleep } from './_http.mjs';
 // hire-type / posted-date); we extract it when a marker is present and leave it
 // empty otherwise. postedAt comes from the "Posted DD-Mon-YYYY" subtitle.
 
-const PAGE_SIZE = 6; // Avature serves exactly 6 results per page
-const DEFAULT_MAX_PAGES = 50; // ~300 postings; override via entry.max_pages
+const DEFAULT_MAX_PAGES = 50; // override via entry.max_pages
 const HARD_MAX_PAGES = 200;
-// Pause between successive page requests. Avature's 6-results-per-page cap makes
-// large boards request-heavy (a 999+ board is ~170 pages); firing those with no
+// Pause between successive page requests. Small pages make large boards
+// request-heavy; firing those with no
 // gap risks the tenant's WAF rate-limiting the burst. Mirrors workday's
 // INTER_PAGE_DELAY_MS — only boards that paginate past page 0 pay it.
 const INTER_PAGE_DELAY_MS = 250;
@@ -66,12 +64,15 @@ function clean(s) {
 // "Posted 02-May-2026" → epoch ms (UTC midnight). Undefined when absent/unparseable.
 /** @param {string} block */
 function parsePosted(block) {
-  const m = block.match(/Posted\s+(\d{1,2})-([A-Za-z]{3})-(\d{4})/);
+  const m = block.match(/Posted\s+(\d{1,2})-([A-Za-z]{3})-(\d{4})(?!\d)/);
   if (!m) return undefined;
   const mon = MONTHS[m[2].toLowerCase()];
   if (mon === undefined) return undefined;
-  const ms = Date.UTC(Number(m[3]), mon, Number(m[1]));
-  return Number.isNaN(ms) ? undefined : ms;
+  const year = Number(m[3]);
+  const day = Number(m[1]);
+  const ms = Date.UTC(year, mon, day);
+  const date = new Date(ms);
+  return date.getUTCFullYear() === year && date.getUTCMonth() === mon && date.getUTCDate() === day ? ms : undefined;
 }
 
 // Best-effort location: some tenants tag it with a list-item-location span or a
@@ -85,29 +86,43 @@ function parseLocation(block) {
   return m ? clean(m[1]) : '';
 }
 
-/** @param {string} htmlText @param {string} origin */
-export function parseArticles(htmlText, origin) {
+/** @param {string} attributes @param {string} name */
+function attribute(attributes, name) {
+  return attributes.match(new RegExp(`(?:^|\\s)${name}\\s*=\\s*(["'])([\\s\\S]*?)\\1`, 'i'))?.[2] || '';
+}
+
+/** @param {string} htmlText */
+function resultBlocks(htmlText) {
+  return [...htmlText.matchAll(/<article\b([^>]*)>[\s\S]*?<\/article\s*>/gi)]
+    .filter(match => attribute(match[1], 'class').split(/\s+/).includes('article--result'))
+    .map(match => match[0]);
+}
+
+/** @param {string[]} blocks @param {string} origin */
+function parseBlocks(blocks, origin) {
   const out = [];
-  // Tenants vary the result class: Synopsys uses `article--result`, Siemens
-  // appends a position index (`article--result 1`). Accept any suffix.
-  const re = /<article class="article article--result[^"]*"[\s\S]*?<\/article>/g;
-  let a;
-  while ((a = re.exec(htmlText)) !== null) {
-    const block = a[0];
+  for (const block of blocks) {
     // JobDetail path may or may not sit under /careers/ (branded tenants vary),
     // so anchor on JobDetail/ itself rather than a fixed prefix. Prefer the
     // `class="link"` title anchor (most tenants); fall back to any JobDetail
     // anchor for tenants (e.g. Rohde & Schwarz) whose title link carries no
     // class. Share/mailto buttons url-encode the path (%2FJobDetail%2F) so they
     // never match the literal `/JobDetail/` and can't be mistaken for the title.
-    const urlM =
-      block.match(/<a[^>]*class="link"[^>]*href="([^"]*\/JobDetail\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/) ||
-      block.match(/<a[^>]*href="([^"]*\/JobDetail\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/);
-    if (!urlM) continue;
-    const title = clean(urlM[2]);
+    const anchors = [...block.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi)]
+      .map(match => ({ href: attribute(match[1], 'href'), classes: attribute(match[1], 'class').split(/\s+/), title: clean(match[2]) }))
+      .filter(anchor => /\/JobDetail\//.test(anchor.href) && anchor.title);
+    const anchor = anchors.find(item => item.classes.includes('link')) || anchors[0];
+    if (!anchor) continue;
+    const title = anchor.title;
     if (!title) continue;
-    let url = decodeEntities(urlM[1]);
-    if (!/^https?:\/\//i.test(url)) url = origin + (url.startsWith('/') ? url : '/' + url);
+    let resolved;
+    try {
+      resolved = new URL(decodeEntities(anchor.href), origin);
+    } catch {
+      continue;
+    }
+    if (!['https:', 'http:'].includes(resolved.protocol) || resolved.username || resolved.password) continue;
+    const url = resolved.href;
     const idM = url.match(/\/JobDetail\/[^/]*\/(\d+)/);
     out.push({
       id: idM ? idM[1] : url,
@@ -118,6 +133,35 @@ export function parseArticles(htmlText, origin) {
     });
   }
   return out;
+}
+
+/** @param {string} htmlText @param {string} origin */
+export function parseArticles(htmlText, origin) {
+  return parseBlocks(resultBlocks(htmlText), origin);
+}
+
+// A total such as "999+" is only a lower bound, never completion evidence.
+/** @param {string} htmlText */
+function parseTotal(htmlText) {
+  const match = htmlText.match(/\bdata-total\s*=\s*(["'])\s*(\d[\d,]*)(\+?)\s*\1/i);
+  if (!match) return null;
+  const count = Number(match[2].replaceAll(',', ''));
+  return Number.isSafeInteger(count) ? { count, exact: !match[3] } : null;
+}
+
+// HTTP 200 is not proof that a career-site response is a usable jobs page.
+// Check blocking evidence before accepting a declared zero or no-results text.
+/** @param {string} htmlText @param {{ count: number, exact: boolean } | null} total */
+function emptyPageEvidence(htmlText, total) {
+  const visible = clean(htmlText.replace(/<(script|style|template)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '').replace(/<!--[\s\S]*?-->/g, ''));
+  const loginHeading = /<(?:h1|title)\b[^>]*>\s*(?:sign\s*in|log\s*in|login)\b/i.test(htmlText);
+  const passwordField = [...htmlText.matchAll(/<input\b([^>]*)>/gi)].some(match => attribute(match[1], 'type').toLowerCase() === 'password');
+  if (loginHeading || passwordField || /\b(?:access denied|verify (?:that )?you are human|checking your browser|captcha|authentication required|sign in to (?:continue|access)|log in to (?:continue|access))\b/i.test(visible) || /\b(?:cf-chl|challenge-platform|g-recaptcha|h-captcha)\b/i.test(htmlText)) {
+    return 'blocked';
+  }
+  if (total?.exact && total.count === 0) return 'empty';
+  if (!total && /\b(?:no (?:jobs|results) (?:were )?found|no jobs match(?:ing)?\b|there are (?:currently )?no (?:open )?(?:jobs|positions)\b)/i.test(visible)) return 'empty';
+  return 'unrecognized';
 }
 
 /** @type {Provider} */
@@ -155,12 +199,19 @@ export default {
     const jobs = [];
     const seen = new Set();
 
-    const getPage = async (param, page) => {
-      const htmlText = await ctx.fetchText(`${cfg.searchUrl}?${param}=${page * PAGE_SIZE}`, {
+    const getPage = async (param, offset) => {
+      const htmlText = await ctx.fetchText(`${cfg.searchUrl}?${param}=${offset}`, {
         redirect: 'error',
         headers: { accept: 'text/html' },
       });
-      return parseArticles(htmlText, cfg.origin);
+      const blocks = resultBlocks(htmlText);
+      const total = parseTotal(htmlText);
+      if (blocks.length === 0) {
+        const evidence = emptyPageEvidence(htmlText, total);
+        if (evidence === 'blocked') throw new Error(`avature: blocked or login response for ${entry.name} at offset=${offset}`);
+        if (offset === 0 && evidence !== 'empty') throw new Error(`avature: unrecognized first-page markup for ${entry.name}; no result rows or confirmed no-jobs evidence`);
+      }
+      return { articles: parseBlocks(blocks, cfg.origin), rowCount: blocks.length, total };
     };
     // Absorb a page's articles, returning how many were not already seen.
     const absorb = (articles) => {
@@ -180,34 +231,68 @@ export default {
       return fresh;
     };
 
+    let offset = 0;
+    let pageSize = 0;
+    let knownTotal = null;
+    let stopped = false;
+    let skippedRows = false;
+    const warn = reason => console.error(`⚠️ avature: ${entry.name} partial/truncated: ${reason} (${jobs.length} unique jobs collected; advertised total ${knownTotal ? `${knownTotal.count}${knownTotal.exact ? '' : '+'}` : 'unknown'})`);
+    const observe = pageData => {
+      if (pageData.rowCount > pageData.articles.length) skippedRows = true;
+      if (!knownTotal) knownTotal = pageData.total;
+      else if (pageData.total && (pageData.total.count !== knownTotal.count || !pageData.total.exact)) {
+        knownTotal = { count: Math.max(knownTotal.count, pageData.total.count), exact: false };
+      }
+    };
     for (let page = 0; page < maxPages; page++) {
       if (page > 0) await sleep(INTER_PAGE_DELAY_MS, ctx);
-      let articles = await getPage(offsetParam, page);
-      let fresh = absorb(articles);
+      let pageData = await getPage(offsetParam, offset);
+      observe(pageData);
+      let fresh = absorb(pageData.articles);
 
       // Self-heal: the first paginated page didn't advance — either it repeated
       // page 0 (all-dup) or came back empty because the primary key is inert
       // (some tenants echo page 0 for an unknown param, others return nothing).
       // Retry this page once with the fallback key; if it advances, adopt it for
-      // the remainder. Only on page 1 — inert pagination manifests immediately,
-      // so a later non-advancing page is a genuine end-of-board, not a mismatch.
+      // the remainder. Only on page 1; later repeats stop with a partial warning
+      // instead of being assumed to prove the board is exhausted.
       // NOTE: fresh === 0 must be evaluated before the empty-page break below,
       // or an inert key that returns an empty page 1 would exit without healing.
       if (fresh === 0 && canHeal && page === 1) {
         canHeal = false;
         await sleep(INTER_PAGE_DELAY_MS, ctx);
-        const altArticles = await getPage(FALLBACK_OFFSET_PARAM, page);
-        const altFresh = absorb(altArticles);
+        const alternative = await getPage(FALLBACK_OFFSET_PARAM, offset);
+        observe(alternative);
+        const altFresh = absorb(alternative.articles);
         if (altFresh > 0) {
           offsetParam = FALLBACK_OFFSET_PARAM;
-          articles = altArticles;
+          pageData = alternative;
           fresh = altFresh;
         }
       }
 
-      if (fresh === 0) break; // empty page / looped / offset ignored / last page
-      if (articles.length < PAGE_SIZE) break; // last page
+      if (knownTotal?.exact && jobs.length === knownTotal.count && !skippedRows) {
+        stopped = true;
+        break;
+      }
+      if (fresh === 0) {
+        if (pageData.rowCount > 0 || skippedRows || (knownTotal && (!knownTotal.exact || jobs.length < knownTotal.count))) {
+          warn('non-advancing or empty page before confirmed exhaustion');
+        }
+        stopped = true;
+        break;
+      }
+      pageSize ||= pageData.rowCount;
+      offset += pageData.rowCount;
+      // A short page is a useful end signal only when no advertised total says
+      // otherwise. First-page length alone cannot tell us a tenant's page cap.
+      if (!knownTotal && pageData.rowCount < pageSize) {
+        if (skippedRows) warn('unparseable result rows');
+        stopped = true;
+        break;
+      }
     }
+    if (!stopped) warn(`max_pages=${maxPages} reached`);
     return jobs;
   },
 };

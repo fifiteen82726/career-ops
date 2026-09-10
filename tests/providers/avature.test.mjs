@@ -74,11 +74,11 @@ try {
   else fail(`parseArticles missed the no-class-link variant: ${JSON.stringify(vArts.map((a) => a.id))}`);
 
   // Pagination key — default `jobOffset`, self-heals to `offset` for tenants
-  // that ignore it (Siemens). Mock fetchText with an article-less page so
+  // that ignore it (Siemens). Mock fetchText with an explicit zero-jobs page so
   // fetch() stops after one request and we can read the URL it built.
   const captureFirstUrl = async (entry) => {
     let firstUrl;
-    const ctx = { sleep: async () => {}, fetchText: async (url) => { if (firstUrl === undefined) firstUrl = url; return '<div>no articles</div>'; } };
+    const ctx = { sleep: async () => {}, fetchText: async (url) => { if (firstUrl === undefined) firstUrl = url; return '<div data-total="0">No jobs found.</div>'; } };
     await avature.fetch(entry, ctx);
     return firstUrl;
   };

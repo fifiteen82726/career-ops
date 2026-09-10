@@ -5,6 +5,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as yaml from 'js-yaml';
 import { normalizeCompanyIdentity } from './build-sunny-h1b-ats-universe.mjs';
+import { parseQuotedTsv } from './sunny-tsv.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '../..');
@@ -14,13 +15,7 @@ function clean(value) {
 }
 
 function parseTsv(path) {
-  const lines = readFileSync(path, 'utf8').trimEnd().split(/\r?\n/);
-  if (!lines[0]) return [];
-  const columns = lines[0].split('\t');
-  return lines.slice(1).filter(Boolean).map(line => {
-    const values = line.split('\t');
-    return Object.fromEntries(columns.map((column, index) => [column, values[index] ?? '']));
-  });
+  return parseQuotedTsv(readFileSync(path, 'utf8'));
 }
 
 function employerNames(row) {

@@ -65,9 +65,9 @@ const MAX_SPLIT_SLICES = 100;
 // pathological tenant from eating a sweep.
 const SPLIT_PAGE_BUDGET_FACTOR = 5;
 
-// Workday returns postings newest-first, so pagination can stop once a
-// page's oldest *dated* posting is well past --since — no point paying for
-// (and rate-limit-risking) pages that are entirely stale. Only unambiguous
+// Date early-stop assumes Workday returns postings broadly newest-first, so
+// pagination can stop once a page's oldest *dated* posting is well past
+// --since, avoiding requests for pages assumed to be stale. Only unambiguous
 // numeric ages ("Posted N Days Ago", N < 30) count for this; the unbounded
 // "30+ Days Ago" bucket never triggers it, so a wide --since (>=30 days)
 // simply never early-stops rather than risk a false stop.
@@ -76,7 +76,10 @@ const SPLIT_PAGE_BUDGET_FACTOR = 5;
 // return day-labels slightly out of order across consecutive postings ("27
 // Days Ago | 26 Days Ago | 27 Days Ago"), roughly 1 day of jitter. The
 // margin only needs to clear that; 2 is double it as a plain safety factor,
-// not a second measurement.
+// not a second measurement. This does not cover boards that pin much older
+// postings ahead of fresh ones. Set `date_early_stop: false` on such an entry
+// to disable both date early-stop and the undated-first-page shortcut below;
+// pagination caps and downstream posting-date eligibility still apply.
 const EARLY_STOP_MARGIN_MS = 2 * 86_400_000;
 
 /** Resolve the page cap: a positive integer `max_pages` on the entry, capped. */
@@ -432,7 +435,7 @@ export default {
    * origin/referer clears it without needing per-tenant config (same fix
    * as providers/glints.mjs's firewall).
    *
-   * @param {{ name?: string, api?: string, careers_url?: string, max_pages?: number }} entry
+   * @param {{ name?: string, api?: string, careers_url?: string, max_pages?: number, date_early_stop?: boolean }} entry
    * @param {{ fetchJson: (url: string, opts?: object) => Promise<any>, sinceMs?: number, maxPages?: number, syntheticEntries?: boolean }} ctx
    * @returns {Promise<Array<{title: string, url: string, company: string, location: string, postedAt?: number}>>}
    */
@@ -453,7 +456,10 @@ export default {
       },
     };
     const makeBody = (offset, appliedFacets) => JSON.stringify({ limit: PAGE_SIZE, offset, searchText: '', appliedFacets });
-    const sinceMs = typeof ctx?.sinceMs === 'number' ? ctx.sinceMs : null;
+    // Keep the opt-out local: downstream date filtering still needs ctx.sinceMs.
+    const sinceMs = entry.date_early_stop === false
+      ? null
+      : (typeof ctx?.sinceMs === 'number' ? ctx.sinceMs : null);
     const maxPages = resolveMaxPages(entry);
 
     // Honor a context page cap — verify-portals' liveness probe sets
@@ -522,11 +528,11 @@ export default {
       // no dated posting to recognize as "past the window".
       const sawAnyDatedPosting = jobs.some((j) => typeof j.postedAt === 'number');
 
-      // Zero dated postings on page 0, --include-undated off, --since-bounded
-      // scan: further pagination is pure waste — every posting from this
-      // tenant will be dropped downstream as undated regardless of page count
-      // (newest-first sort means if the *freshest* postings lack a date, older
-      // ones will too). Return page 0's results instead of grinding to maxPages.
+      // By default, an undated first page in a --since-bounded scan with
+      // --include-undated off is assumed to represent an undated board, whose
+      // postings would all be dropped downstream. Later pages can carry dates,
+      // so date_early_stop: false disables this shortcut too (sinceMs is null).
+      // Otherwise return page 0's results instead of grinding to maxPages.
       if (stopReason === 'complete' && sinceMs !== null && ctx?.includeUndated !== true
         && !sawAnyDatedPosting && jobs.length > 0) {
         stopReason = 'no-date-skip';

@@ -19,6 +19,7 @@ import { acquirePipelineLock } from '../../pipeline-lock.mjs';
 import { isMainModule } from '../../lib/is-main-module.mjs';
 import { portalEntryBoardKey, portalBoardKey } from './sunny-company-expansion.mjs';
 import { statePaths } from './sunny-company-state.mjs';
+import { enqueueScanReceipt } from './sunny-job-queue.mjs';
 
 const CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const PARTIAL_PATTERN = /\b(?:partial|truncat(?:ed|ion)?|page cap|max_pages|budget exhausted)\b/i;
@@ -43,8 +44,11 @@ export function buildExactBoardPortals(fullConfig, { provider, identifier }) {
 }
 
 export function classifyScanCompletion({ exitCode, stderr = '', receipt = null }) {
-  if (PARTIAL_PATTERN.test(stderr)) return 'partial';
-  if (Number(exitCode) !== 0 || (receipt?.errors?.length || 0) > 0) return 'error';
+  if (exitCode !== 0 || receipt?.version !== 'careerops.scan.receipt@1'
+    || !Array.isArray(receipt.added_urls) || !Array.isArray(receipt.errors) || receipt.errors.length > 0) return 'error';
+  if (PARTIAL_PATTERN.test(stderr) || receipt.partial === true || receipt.partial_boards?.length > 0
+    || Number(receipt.skipped || 0) > 0
+    || (Array.isArray(receipt.warnings) && receipt.warnings.some(warning => PARTIAL_PATTERN.test(typeof warning === 'string' ? warning : JSON.stringify(warning))))) return 'partial';
   return 'complete';
 }
 
@@ -212,6 +216,10 @@ export async function runSerializedScan({
     };
     const receiptPath = join(paths.receipts, `${runId}.json`);
     writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, 'utf8');
+    // Persist receipt first: a queue-write failure can be replayed without rescanning.
+    if (!dryRun && scanReceipt?.version === 'careerops.scan.receipt@1' && Array.isArray(scanReceipt.added_urls)) {
+      await enqueueScanReceipt(receipt, { dataRoot: paths.root });
+    }
     if (temporaryPortals) {
       try { unlinkSync(temporaryPortals); } catch { /* preserve receipt even if cleanup races */ }
     }

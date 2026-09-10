@@ -5,7 +5,7 @@
  *
  * Where scan.mjs scans the companies you track in portals.yml, this script
  * inverts the direction: it walks public directories of companies per ATS
- * (Greenhouse, Lever, Ashby, Workday, iCIMS) and surfaces fresh postings that match
+ * (Greenhouse, Lever, Ashby, Workday, iCIMS, Paylocity) and surfaces fresh postings that match
  * your portals.yml `title_filter` / `location_filter` — no manual company
  * curation needed.
  *
@@ -54,6 +54,8 @@ import lever from './providers/lever.mjs';
 import ashby from './providers/ashby.mjs';
 import workday from './providers/workday.mjs';
 import icims from './providers/icims.mjs';
+import paylocity from './providers/paylocity.mjs';
+import bamboohr from './providers/bamboohr.mjs';
 import { buildTitleFilter, buildTitleFilterOverrides, buildTitleFilterWithOverrides, buildLocationFilter, buildContentFilter, matchedTitleKeywords, loadSeenUrls, normalizeUrlForDedup, appendToPipeline, appendToScanHistory, loadBlacklist, parseSinceDays, PORTALS_PATH, PIPELINE_PATH } from './scan.mjs';
 import { localToday } from './lib/local-today.mjs';
 import { printScanSummaryHeader } from './lib/scan-summary-marker.mjs';
@@ -207,6 +209,14 @@ export function entryOnHost(name, careersUrl, isCanonicalHost) {
 // Each source: the provider module that does the fetching, plus how to turn a
 // dataset entry into a synthetic PortalEntry the provider can detect/fetch.
 export const SOURCES = {
+  bamboohr: {
+    provider: bamboohr,
+    concurrency: 10,
+    dataset: `${DATASET_BASE}/bamboohr_companies.json`,
+    toEntry: (slug) => SLUG_RE.test(String(slug))
+      ? entryOnHost(String(slug), `https://${slug}.bamboohr.com/careers`, h => h === `${String(slug).toLowerCase()}.bamboohr.com`)
+      : null,
+  },
   greenhouse: {
     provider: greenhouse,
     // Whole directory behind one host — see SINGLE_HOST_CONCURRENCY.
@@ -254,6 +264,21 @@ export const SOURCES = {
     toEntry: (slug) => SLUG_RE.test(String(slug))
       ? entryOnHost(String(slug), `https://careers-${slug}.icims.com/jobs/search?ss=1&in_iframe=1`, h => h === `careers-${String(slug).toLowerCase()}.icims.com`)
       : null,
+  },
+  paylocity: {
+    provider: paylocity,
+    concurrency: 5,
+    dataset: `${DATASET_BASE}/paylocity_companies_clean.json`,
+    toEntry: (row) => {
+      const guid = String(row?.guid || '').toLowerCase();
+      if (!(Number(row?.jobs) > 0)
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(guid)) return null;
+      return entryOnHost(
+        String(row?.name || guid),
+        `https://recruiting.paylocity.com/recruiting/jobs/All/${guid}/`,
+        h => h === 'recruiting.paylocity.com',
+      );
+    },
   },
 };
 

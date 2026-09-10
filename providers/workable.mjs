@@ -210,10 +210,11 @@ function safeJobUrl(raw) {
  * match that shape so location_filter behaves identically across both paths.
  */
 function formatLocation(job) {
-  const parts = [job?.city, job?.country].filter(v => typeof v === 'string' && v.trim());
-  const joined = parts.map(v => v.trim()).join(', ');
-  if (joined) return joined;
-  return job?.telecommuting ? 'Remote' : '';
+  const format = location => [location?.city, location?.country].filter(v => typeof v === 'string' && v.trim()).map(v => v.trim()).join(', ');
+  const locations = [format(job), ...(Array.isArray(job?.locations) ? job.locations : [])
+    .filter(location => location.hidden !== true).map(format)];
+  if (job?.telecommuting === true || job?.workplace_type === 'remote') locations.push('Remote');
+  return [...new Set(locations.filter(Boolean))].join(' · ');
 }
 
 /** Strip HTML tags/entities from the widget's rich-text description. */
@@ -238,7 +239,7 @@ function toPlainText(html) {
 export function parseWorkableWidget(payload, companyName) {
   if (!payload || !Array.isArray(payload.jobs)) return [];
   const jobs = [];
-  const seen = new Set();
+  const seen = new Map();
   for (const raw of payload.jobs) {
     const title = typeof raw?.title === 'string' ? raw.title.trim() : '';
     if (!title) continue;
@@ -246,8 +247,7 @@ export function parseWorkableWidget(payload, companyName) {
     // shortlink is the canonical public permalink; url is the same host. Either
     // is fine, both are validated. Off-domain or non-https entries are dropped.
     const url = safeJobUrl(raw?.shortlink) || safeJobUrl(raw?.url);
-    if (!url || seen.has(url)) continue;
-    seen.add(url);
+    if (!url) continue;
 
     /** @type {any} */
     const job = { title, url, location: formatLocation(raw), company: companyName };
@@ -257,6 +257,16 @@ export function parseWorkableWidget(payload, companyName) {
 
     const stamp = Date.parse(raw?.published_on || raw?.created_at || '');
     if (Number.isFinite(stamp)) job.postedAt = stamp;
+
+    const previous = seen.get(url);
+    if (previous) {
+      previous.location = [...new Set([previous.location, job.location].flatMap(value => value.split(' · ')).filter(Boolean))].join(' · ');
+      // Do not make an old requisition look new through a later city listing.
+      if (Number.isFinite(stamp)) previous.postedAt = Math.min(previous.postedAt ?? Infinity, stamp);
+      if (!previous.description && job.description) previous.description = job.description;
+      continue;
+    }
+    seen.set(url, job);
 
     jobs.push(job);
   }

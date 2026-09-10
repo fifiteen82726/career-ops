@@ -23,6 +23,7 @@ export const RESOLUTION_COLUMNS = [
   'last_attempt_at', 'next_retry_at', 'backfill_status', 'backfill_window_start',
   'backfill_window_end', 'backfill_attempted_at', 'backfill_completed_at',
   'backfill_error', 'evidence', 'reason',
+  'dol_evidence_tier', 'dol_evidence_periods', 'dol_evidence_window', 'dol_latest_decision_date',
 ];
 
 export const RESOLUTION_STATUSES = new Set([
@@ -97,17 +98,44 @@ function validateResolutionRow(row) {
 
 export function mergeResolutionRows(current, incoming) {
   const byKey = new Map();
+  const boundIncoming = new Set((incoming || []).filter(row => row.provider && row.board_identifier).map(row => row.normalized_lead));
   for (const row of current || []) {
     validateResolutionRow(row);
-    byKey.set(row.normalized_lead, { ...row });
+    if (!(row.provider && row.board_identifier) && boundIncoming.has(row.normalized_lead)) continue;
+    byKey.set(resolutionRowKey(row), { ...row });
   }
   for (const row of incoming || []) {
     validateResolutionRow(row);
-    byKey.set(row.normalized_lead, { ...(byKey.get(row.normalized_lead) || {}), ...row });
+    const key = resolutionRowKey(row);
+    const previous = byKey.get(key);
+    const merged = { ...(previous || {}), ...row };
+    // Discovery finishes outside the state lock; it must not rewind a worker
+    // that completed while official identity checks were in flight.
+    if (previous?.backfill_window_start && previous.backfill_window_end) {
+      for (const field of RESOLUTION_COLUMNS.filter(column => column.startsWith('backfill_'))) {
+        merged[field] = previous[field];
+      }
+      const controlAt = Math.max(...['last_attempt_at', 'backfill_attempted_at', 'backfill_completed_at']
+        .map(field => Date.parse(previous[field]) || 0));
+      const stale = (Date.parse(row.last_attempt_at) || 0) <= controlAt;
+      if (previous.status === 'accepted' && (stale || row.status === 'already_tracked')) {
+        for (const field of ['status', 'reason', 'evidence', 'health_status', 'last_attempt_at', 'next_retry_at']) {
+          merged[field] = previous[field];
+        }
+      }
+    }
+    byKey.set(key, merged);
   }
   return [...byKey.values()].sort((left, right) => (
     left.normalized_lead.localeCompare(right.normalized_lead)
   ));
+}
+
+export function resolutionRowKey(row) {
+  const provider = String(row.provider || '').toLowerCase();
+  const identifier = String(row.board_identifier || '');
+  return JSON.stringify([row.normalized_lead, provider,
+    ['eightfold', 'oraclecloud'].includes(provider) ? identifier : identifier.toLowerCase()]);
 }
 
 export function readResolutionRows({ dataRoot = getCareerOpsRoot() } = {}) {

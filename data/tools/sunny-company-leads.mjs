@@ -13,7 +13,10 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
+  writeFileSync,
 } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
 import { getCareerOpsRoot } from '../../path-resolver.mjs';
@@ -31,10 +34,12 @@ export const LEAD_COLUMNS = [
   'job_location',
   'job_url',
   'posted_at',
+  'posted_at_raw',
+  'posted_at_kind',
 ];
 
 const TRACKING_PARAMS = new Set([
-  'alternateChannel', 'eBP', 'fmid', 'from', 'gh_jid', 'gh_src', 'refId',
+  'alternateChannel', 'eBP', 'fmid', 'from', 'gh_src', 'refId',
   'source', 'ssid', 'trk', 'trackingId', 'utm_campaign', 'utm_content',
   'utm_medium', 'utm_source', 'utm_term',
 ].map(value => value.toLowerCase()));
@@ -80,11 +85,16 @@ export function canonicalLeadUrl(value) {
 
 function normalizePostedAt(value) {
   const raw = clean(value);
-  if (!raw) return '';
-  const exact = raw.match(/^\d{4}-\d{2}-\d{2}/)?.[0];
-  if (exact) return exact;
-  const parsed = new Date(raw);
-  return Number.isNaN(parsed.getTime()) ? raw : parsed.toISOString().slice(0, 10);
+  if (!raw) return { posted_at: '', posted_at_raw: '', posted_at_kind: 'missing' };
+  const exact = raw.match(/^\d{4}-\d{2}-\d{2}(?=$|T| )/)?.[0];
+  if (exact) {
+    const date = new Date(`${exact}T00:00:00Z`);
+    if (Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === exact) {
+      return { posted_at: exact, posted_at_raw: raw, posted_at_kind: 'source_calendar_date' };
+    }
+  }
+  // The source's relative label is retained, never converted to a made-up ATS date.
+  return { posted_at: '', posted_at_raw: raw, posted_at_kind: 'unresolved' };
 }
 
 export function normalizeLead(row, {
@@ -114,14 +124,15 @@ export function normalizeLead(row, {
     job_title: title,
     job_location: clean(row?.location ?? row?.job_location),
     job_url: canonicalLeadUrl(row?.url ?? row?.job_url),
-    posted_at: normalizePostedAt(row?.posted_at ?? row?.postedAt ?? row?.date_posted),
+    ...normalizePostedAt(row?.posted_at_raw ?? row?.posted_at ?? row?.postedAt ?? row?.date_posted),
   };
 }
 
 export function leadKey(row) {
-  if (row.job_url) return row.job_url;
+  if (row.job_url) return [row.source, row.scope, row.job_url].join('|');
   return [
     row.source,
+    row.scope,
     row.normalized_source_company,
     normalizeLeadText(row.job_title),
     normalizeLeadText(row.job_location),
@@ -166,7 +177,8 @@ export async function ingestLeadRows(rows, {
   const lock = await acquirePipelineLock(join(dataRoot, 'data/.sunny-company-state'), lockOptions);
 
   try {
-    const known = new Set(parseLedger(path).map(leadKey));
+    const previous = parseLedger(path);
+    const known = new Set(previous.map(leadKey));
     const accepted = [];
     const rejected = [];
     let duplicates = 0;
@@ -189,8 +201,17 @@ export async function ingestLeadRows(rows, {
       accepted.push(normalized);
     }
 
-    if (accepted.length) {
-      if (!existsSync(path)) appendFileSync(path, `${LEAD_COLUMNS.join('\t')}\n`, 'utf8');
+    const oldHeader = existsSync(path) ? readFileSync(path, 'utf8').split(/\r?\n/, 1)[0] : '';
+    if (oldHeader && oldHeader !== LEAD_COLUMNS.join('\t')) {
+      const columns = oldHeader.split('\t');
+      if (columns.some(column => !LEAD_COLUMNS.includes(column))) throw new Error('Unknown lead ledger columns; refusing destructive schema migration');
+      const migrated = previous.map(row => ({ ...row,
+        ...normalizePostedAt(row.posted_at_raw || row.posted_at) }));
+      const temporary = `${path}.tmp-${randomUUID()}`;
+      writeFileSync(temporary, `${LEAD_COLUMNS.join('\t')}\n${[...migrated, ...accepted].map(renderRow).join('')}`, 'utf8');
+      renameSync(temporary, path);
+    } else if (accepted.length) {
+      if (!oldHeader) appendFileSync(path, `${LEAD_COLUMNS.join('\t')}\n`, 'utf8');
       appendFileSync(path, accepted.map(renderRow).join(''), 'utf8');
     }
 
