@@ -303,6 +303,30 @@ try {
     eq('fetch() honours Retry-After exactly', slept[0], 30_000);
   }
 
+  // Feed requests share app.jobvite.com. Starting two tenant feeds together
+  // must hold the second until the first has left the transport, otherwise the
+  // host's immediate 429 rate limit defeats the retry policy above.
+  {
+    let entered = 0;
+    let releaseFirst;
+    const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+    const ctx = {
+      fetchText: async () => {
+        entered++;
+        if (entered === 1) await firstGate;
+        return XML;
+      },
+      fetchJson: async () => ({}),
+    };
+    const first = jobvite.fetch({ name: 'First', company_eid: 'q6NaVfwI' }, ctx);
+    const second = jobvite.fetch({ name: 'Second', company_eid: 'q1TaVfwJ' }, ctx);
+    await Promise.resolve();
+    eq('fetch() serializes concurrent configured-eId XML feed requests', entered, 1);
+    releaseFirst();
+    await Promise.all([first, second]);
+    eq('fetch() runs both queued XML feed requests', entered, 2);
+  }
+
   // A 4xx that is not 429 is the server rejecting the request itself; retrying
   // it just burns wall-clock on every scan.
   {

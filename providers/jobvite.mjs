@@ -2,6 +2,7 @@
 /** @typedef {import('./_types.js').Provider} Provider */
 
 import { fetchTextWithRetry } from './_http.mjs';
+import { createHostPacer } from './_host-pacer.mjs';
 // Shared decoder, not a private copy. This provider's stricter XML 1.0 §2.2 Char
 // guard was upstreamed into _html-entities.mjs (#2623); keeping the local one
 // only risked the two drifting apart again — which is the drift that module
@@ -246,6 +247,7 @@ function buildBoardFetchUrl(slug) {
  * clamp silently truncating the wait into another guaranteed 429.
  */
 const RETRY_POLICY = { retries: 2, baseDelayMs: 1_000, maxDelayMs: 15_000 };
+const { pace: jobviteFeedPacer } = createHostPacer();
 
 /**
  * Whether a thrown redirect is the feed saying "this board is empty".
@@ -316,12 +318,12 @@ export default {
     const feedUrl = buildFeedUrl(eid);
     assertJobviteHost(feedUrl);
     try {
-      const xml = await fetchTextWithRetry(
+      const xml = await jobviteFeedPacer(() => fetchTextWithRetry(
         ctx,
         feedUrl,
         { redirect: 'manual', timeoutMs: FEED_TIMEOUT_MS },
         RETRY_POLICY,
-      );
+      ), ctx);
       return parseJobviteXml(xml, entry.name);
     } catch (err) {
       // An empty board is reported as a redirect to NoJobs.htm rather than as
