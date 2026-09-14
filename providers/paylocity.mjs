@@ -2,10 +2,14 @@
 /** @typedef {import('./_types.js').Provider} Provider */
 
 import { decodeEntities } from './_html-entities.mjs';
+import { fetchTextWithRetry } from './_http.mjs';
+import { createHostPacer } from './_host-pacer.mjs';
 
 const HOST = 'recruiting.paylocity.com';
 const GUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 const BOARD_PATH_RE = new RegExp(`^/recruiting/jobs/All/(${GUID})/?$`, 'i');
+const { pace: paylocityPacer } = createHostPacer({ minimumIntervalMs: 1000 });
+const RETRY_POLICY = { retries: 3, baseDelayMs: 1000, maxDelayMs: 15000 };
 
 function boardUrl(entry) {
   try {
@@ -56,12 +60,12 @@ export default {
   async fetch(entry, ctx) {
     const url = boardUrl(entry);
     if (!url) throw new Error(`paylocity: cannot derive exact board URL for ${entry.name}`);
-    const html = await ctx.fetchText(url, {
+    const html = await paylocityPacer(() => fetchTextWithRetry(ctx, url, {
       redirect: 'error',
       headers: { 'user-agent': 'Mozilla/5.0' },
       timeoutMs: 30_000,
       maxBytes: 2_000_000,
-    });
+    }, RETRY_POLICY), ctx);
     return parsePaylocityPage(html, entry.name);
   },
 };

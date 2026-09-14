@@ -29,3 +29,36 @@ test('Paylocity parses window.pageData into dated scanner jobs', () => {
   assert.equal(jobs[0].postedAt, Date.parse('2026-09-09T12:42:19-05:00'));
   assert.equal(jobs[0].url, 'https://recruiting.paylocity.com/recruiting/Jobs/Details/4490089');
 });
+
+test('Paylocity retries a rate-limited board fetch', async () => {
+  const waits = [];
+  let calls = 0;
+  const pageData = `<script>window.pageData = ${JSON.stringify({ Jobs: [{
+    JobId: 4490089,
+    JobTitle: 'Data Engineer',
+  }] })};</script>`;
+  const ctx = {
+    sleep(ms) {
+      waits.push(ms);
+    },
+    async fetchText() {
+      calls++;
+      if (calls === 1) {
+        const err = new Error('rate limited');
+        err.status = 429;
+        err.retryAfter = '0';
+        throw err;
+      }
+      return pageData;
+    },
+  };
+
+  const jobs = await paylocity.fetch({
+    name: 'Example Co',
+    careers_url: `https://recruiting.paylocity.com/recruiting/jobs/All/${guid}/`,
+  }, ctx);
+
+  assert.equal(calls, 2);
+  assert.deepEqual(waits, [0]);
+  assert.equal(jobs[0].title, 'Data Engineer');
+});
