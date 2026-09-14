@@ -9,6 +9,7 @@
 // it every Greenhouse board passed those filters blind.
 
 import { htmlToText } from './_html-to-text.mjs';
+import { fetchJsonWithRetry } from './_http.mjs';
 
 const ALLOWED_GREENHOUSE_HOSTS = new Set([
   'boards-api.greenhouse.io',
@@ -164,7 +165,7 @@ export default {
     const listHref = assertGreenhouseUrl(listUrl.href);
     // redirect:'error' prevents SSRF via server-side redirects; combined with
     // assertGreenhouseUrl above it guarantees the final hostname stays in the allowlist.
-    const json = /** @type {any} */ (await ctx.fetchJson(listHref, { redirect: 'error' }));
+    const json = /** @type {any} */ (await fetchJsonWithRetry(ctx, listHref, { redirect: 'error' }));
     const jobs = Array.isArray(json?.jobs) ? json.jobs : [];
     const usable = jobs.filter(/** @param {any} j */ j => j.absolute_url);
 

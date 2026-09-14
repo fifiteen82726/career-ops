@@ -1,6 +1,8 @@
 // @ts-check
 /** @typedef {import('./_types.js').Provider} Provider */
 
+import { fetchJsonWithRetry } from './_http.mjs';
+
 // Lever provider — hits the public postings endpoint.
 // Auto-detects from careers_url via jobs.(eu.)?lever.co/<slug>.
 // Handles both explicit `api:` URLs and auto-detection from `careers_url`.
@@ -79,7 +81,7 @@ export default {
     const apiUrl = resolveApiUrl(entry);
     if (!apiUrl) throw new Error(`lever: cannot derive API URL for ${entry.name}`);
     assertLeverUrl(apiUrl);
-    const json = await ctx.fetchJson(apiUrl, { redirect: 'error' });
+    const json = await fetchJsonWithRetry(ctx, apiUrl, { redirect: 'error' });
     if (!Array.isArray(json)) return [];
     return json.map(j => ({
       title: j.text || '',

@@ -12,7 +12,7 @@
 // cheap title/location filters, so a 10k-tenant sweep pays detail-page
 // requests for real candidates only, never for noise.
 
-import { BROWSER_LIKE_USER_AGENT } from './_http.mjs';
+import { BROWSER_LIKE_USER_AGENT, fetchTextWithRetry } from './_http.mjs';
 import { decodeEntities } from './_html-entities.mjs';
 
 // ~20 postings/page → 30 pages covers 600 postings; tenants bigger than that
@@ -121,7 +121,7 @@ export default {
     let reachedEnd = false;
     for (let pageNum = 0; pageNum < ICIMS_MAX_PAGES; pageNum++) {
       if (pageNum > 0) await sleep(INTER_PAGE_DELAY_MS, ctx);
-      const html = await ctx.fetchText(searchUrl(origin, pageNum), { headers: HEADERS, redirect: 'error' });
+      const html = await fetchTextWithRetry(ctx, searchUrl(origin, pageNum), { headers: HEADERS, redirect: 'error' });
       const pageJobs = parseIcimsSearchPage(html, origin, entry.name);
       if (pageJobs.length === 0) { reachedEnd = true; break; } // past the last page
       // Some tenants serve the last real page again for an out-of-range pr

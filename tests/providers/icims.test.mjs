@@ -103,6 +103,33 @@ const mkCtx = (pages) => ({
   else fail(`jobs=${jobs.length} calls=${mkCtx.calls.join(',')}`);
 }
 
+// The first search page is the primary listing request. A transient transport
+// failure there must retry with ctx.sleep, then preserve normal pagination.
+{
+  let primaryCalls = 0;
+  const requestedPages = [];
+  const retrySleeps = [];
+  const ctx = {
+    transport: 'http',
+    sleep: async ms => { retrySleeps.push(ms); },
+    fetchText: async url => {
+      const pr = Number(new URL(url).searchParams.get('pr'));
+      requestedPages.push(pr);
+      if (pr === 0) {
+        primaryCalls++;
+        if (primaryCalls === 1) throw new Error('fetch failed');
+        return page(mkCard(55, 'Recovered Role'));
+      }
+      return page();
+    },
+  };
+  const jobs = await icims.fetch({ name: 'acmefreight', careers_url: `${ORIGIN}/jobs/search?ss=1` }, ctx);
+  if (primaryCalls === 2 && retrySleeps.length === 2 && requestedPages.join(',') === '0,0,1'
+      && jobs.length === 1 && jobs[0]?.title === 'Recovered Role')
+    pass('fetch retries one transient primary-page failure and preserves pagination');
+  else fail(`primaryCalls=${primaryCalls} sleeps=${retrySleeps.length} pages=${requestedPages.join(',')} jobs=${JSON.stringify(jobs)}`);
+}
+
 // Tenant that repeats the last page for out-of-range pr: repeat-content stop.
 {
   mkCtx.calls = [];

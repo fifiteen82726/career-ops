@@ -217,6 +217,26 @@ try {
     pass('lever.fetch() ignores a non-array allLocations and preserves the primary location');
   else fail(`lever.fetch() row 6 location = ${JSON.stringify(fetched[6]?.location)}`);
 
+  // The board listing is retried through the shared transport policy. Inject a
+  // no-op async sleep so this regression test never waits for real backoff.
+  let retryCalls = 0;
+  const retrySleeps = [];
+  const retried = await lever.fetch(
+    { name: 'Retry Co', careers_url: 'https://jobs.lever.co/retryco' },
+    {
+      fetchJson: async () => {
+        retryCalls++;
+        if (retryCalls === 1) throw new Error('fetch failed');
+        return [{ text: 'Recovered Role', hostedUrl: 'https://jobs.lever.co/retryco/recovered', categories: { location: 'Remote' } }];
+      },
+      sleep: async ms => { retrySleeps.push(ms); },
+    },
+  );
+  if (retryCalls === 2 && retrySleeps.length === 1 && retried.length === 1
+      && retried[0]?.title === 'Recovered Role' && retried[0]?.location === 'Remote')
+    pass('lever.fetch() retries one transient primary-listing failure and normalizes the recovered role');
+  else fail(`lever retry calls=${retryCalls} sleeps=${retrySleeps.length} jobs=${JSON.stringify(retried)}`);
+
   // Non-array response bodies → [], no crash.
   const emptyCases = [null, {}, { postings: [] }, 'nope'];
   let emptyOk = true;

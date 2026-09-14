@@ -116,6 +116,30 @@ try {
     fail(`greenhouse.fetch() url=${JSON.stringify(capturedUrl)} opts=${JSON.stringify(capturedOpts)}`);
   }
 
+  // The listing endpoint is the primary board request. A one-off transport
+  // abort must not discard an otherwise healthy board; ctx.sleep keeps this
+  // deterministic instead of paying the retry backoff in wall-clock time.
+  let retryCalls = 0;
+  const retrySleeps = [];
+  const retried = await greenhouse.fetch(
+    { name: 'Retry Co', careers_url: 'https://job-boards.greenhouse.io/retryco' },
+    {
+      fetchJson: async () => {
+        retryCalls++;
+        if (retryCalls === 1) {
+          const err = new Error('request aborted');
+          err.name = 'AbortError';
+          throw err;
+        }
+        return { jobs: [{ title: 'Recovered Role', absolute_url: 'https://job-boards.greenhouse.io/retryco/jobs/1', location: { name: 'Berlin, Germany' } }] };
+      },
+      sleep: async ms => { retrySleeps.push(ms); },
+    },
+  );
+  if (retryCalls === 2 && retrySleeps.length === 1 && retried.length === 1 && retried[0]?.title === 'Recovered Role')
+    pass('greenhouse.fetch() retries one transient primary-listing abort and maps the recovered job');
+  else fail(`greenhouse retry calls=${retryCalls} sleeps=${retrySleeps.length} jobs=${JSON.stringify(retried)}`);
+
   // content=true must be set idempotently on an entry.api that already pins it.
   let pinnedUrl = null;
   await greenhouse.fetch(
