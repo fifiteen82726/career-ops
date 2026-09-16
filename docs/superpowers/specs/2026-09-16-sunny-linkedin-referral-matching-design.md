@@ -19,6 +19,7 @@ Extend Sunny's existing daily Codex job scan so it uses the already-authenticate
 - Do not write referral matches to Google Sheet.
 - Only a person currently employed by the job's company qualifies. Former employees do not qualify.
 - Keep all connection PII in ignored user-layer files. Never commit it to Git or expose it through the public repository.
+- Implementation and scheduled execution must use the existing saved-project local environment, not a worktree, because the archive, site, custom rules, and private browser/state inputs are intentionally ignored.
 
 ## Chosen approach
 
@@ -41,8 +42,8 @@ The daily automation controls the user's existing Brave session through computer
 5. Read at most the 50 newest connection cards per run.
 6. Preserve LinkedIn's raw date label and parse it into a conservative earliest/latest date range plus precision; never invent an exact date from a relative label.
 7. On the first successful run, retain cards whose entire possible date range is within 14 days. On later runs, merge unseen profile URLs for dedup even if they are not yet verified.
-8. Before opening newly observed profiles, process stored, unexpired `pending_verification` profiles oldest-first.
-9. Open at most 20 profiles and spend at most 10 wall-clock minutes per run across old pending plus new candidates. Stop immediately on a challenge. Remaining eligible candidates stay pending for the next run.
+8. A deterministic selector combines stored unexpired `pending_verification` profiles with newly observed cards. It orders never-attempted pending profiles first by `firstSeenAt`, then previously attempted pending profiles by oldest `lastVerificationAttemptAt`, then new cards. Every attempted inspection updates `lastVerificationAttemptAt`, so an incomplete profile cannot starve the rest of the queue.
+9. The selector emits a mode-`0600` worklist with at most 20 profiles and one absolute deadline 10 wall-clock minutes after the phase begins. The browser consumes only that exact list and stops immediately at the deadline or on a challenge. Remaining eligible candidates stay pending for the next run.
 
 Authentication succeeds only when the Connections list and connection-card semantics are visible. Any redirect or prompt for login, checkpoint, CAPTCHA, email/phone verification, security key, or one-time code produces `linkedin_not_authenticated` or `linkedin_challenge`. The automation must not attempt recovery.
 
@@ -51,6 +52,8 @@ Every LinkedIn string is untrusted external data. It may populate only the decla
 ### 2. Current-employer verification
 
 A person qualifies only when at least one currently active Experience entry explicitly indicates `Present` or has no end date and is marked current. Capture all simultaneous current employments in `currentEmployments[]`; never pick only the first one.
+
+Every profile observation also records `profileInspectionComplete`. It is true only when the full current Experience section was successfully read. A partial capture may add complete new verified observations, but incomplete or unresolved observations cannot downgrade or remove earlier verified employment. Only a completed inspection may change `verified_current` to `not_current` or replace prior employer evidence.
 
 Evidence priority:
 
@@ -88,6 +91,7 @@ Schema version 1:
       "firstSeenAt": "2026-09-16T16:00:30.000Z",
       "lastObservedAt": "2026-09-16T16:00:30.000Z",
       "verificationStatus": "verified_current",
+      "profileInspectionComplete": true,
       "currentEmployments": [
         {
           "employer": "Example Company",
@@ -103,7 +107,7 @@ Schema version 1:
   ],
   "matches": [
     {
-      "matchKey": "https://apply.example/job-1|https://www.linkedin.com/in/example/",
+      "matchKey": "2026-09-15|https://apply.example/job-1|https://www.linkedin.com/in/example/",
       "applyUrl": "https://apply.example/job-1",
       "jobScanDate": "2026-09-15",
       "jobCompany": "Example Company",
@@ -129,7 +133,9 @@ Schema version 1:
 
 Allowed `sourceStatus` values are `ok`, `partial`, `linkedin_not_authenticated`, `linkedin_challenge`, and `error`. Allowed verification states are `pending_verification`, `verified_current`, `not_current`, and `unresolved`. Allowed match qualities are `company_url_exact` and `reviewed_alias`. Date precision is one of `day`, `relative_day`, `relative_week`, or `unknown`; an `unknown` date is not referral-eligible.
 
-Profile URL is the connection identity. `matchKey` is canonical application URL plus canonical profile URL. Full names, URLs, titles, and employment evidence are retained for at most 90 days after `lastObservedAt`; expired PII is purged. SHA-256 profile fingerprints may be retained for 365 days solely for deduplication. State and temporary capture files use mode `0600`.
+Capture, state, worklist, and snapshot contact schemas are strict: undeclared fields are rejected rather than silently retained.
+
+Profile URL is the connection identity. `matchKey` is job scan date plus canonical application URL plus canonical profile URL. Full names, URLs, titles, and employment evidence are retained for at most 90 days after `lastObservedAt`; expired PII is purged. SHA-256 profile fingerprints may be retained for 365 days solely for deduplication. State, candidate/worklist/capture files, and the generated local `jobs.json` use mode `0600`.
 
 Updates are atomic: validate a temporary file, then rename it over the prior valid file. Every merge—successful or skipped—recomputes `matches` from retained connections and current jobs so expired 14-day matches disappear. A failed capture preserves the last successful connections, updates attempt status through an atomic valid document, and never replaces the file with empty data.
 
@@ -140,11 +146,12 @@ Create a zero-network module that:
 - validates the referral state schema;
 - canonicalizes LinkedIn profile/company URLs and application URLs;
 - validates the exact company-map headers, `status=verified`, URL consistency, exact key/display lookup, and conflicting-key collisions while allowing several reviewed keys to share one parent/brand URL;
+- deterministically selects verification work: prior pending oldest-first, then new cards, capped by limit/deadline;
 - selects archive jobs with `scanDate` in the inclusive latest 14-day window;
 - selects connections only when their entire earliest/latest date range is inside that window;
 - excludes people not marked `verified_current`;
 - evaluates every entry in `currentEmployments[]` and matches only by verified company URL or reviewed alias to that URL;
-- deduplicates by `matchKey`;
+- chooses the newest eligible scan date for repeated canonical application URLs and deduplicates by date-qualified `matchKey`;
 - recomputes matches from scratch and removes expired matches;
 - sorts contacts by newest `connectedAtLatest`, then name;
 - returns each job's `referralContacts` array.
@@ -171,13 +178,14 @@ Each enriched job receives:
       "connectedLabelRaw": "Connected 1 day ago",
       "connectedAtEarliest": "2026-09-15",
       "connectedAtLatest": "2026-09-15",
+      "lastObservedAt": "2026-09-16T16:00:30.000Z",
       "matchQuality": "company_url_exact"
     }
   ]
 }
 ```
 
-Jobs without a match receive an empty array. An invalid job archive preserves the entire prior `jobs.json`. Missing or invalid optional referral state must not block fresh job data: rebuild the base snapshot, carry forward only previously validated cached contacts for the same canonical job URLs that remain inside both 14-day windows, and set `referralDataStatus` to the skip/error state. Invalid optional referral data never freezes unrelated jobs.
+Jobs without a match receive an empty array. Snapshot enrichment joins only on exact `jobScanDate|canonicalApplyUrl` and rechecks the row date, so a recent match can never attach to an older row sharing the same URL. `lastObservedAt` is retained in the local contact record solely to enforce the 90-day PII limit during fallback; the UI does not display it. An invalid job archive preserves the entire prior `jobs.json`. Missing or invalid optional referral state must not block fresh job data: rebuild the base snapshot, carry forward only previously validated cached contacts for the same date-qualified job identities that remain inside both 14-day windows and whose `lastObservedAt` is within 90 days, and set `referralDataStatus` to the skip/error state. Invalid optional referral data never freezes unrelated jobs. Snapshot replacement is atomic and mode `0600`.
 
 ### 5. Local website behavior
 
@@ -206,7 +214,7 @@ Codex automation `sunny-24` is the intended authoritative runner. It is currentl
 3. Run a bounded manual smoke while `sunny-24` remains paused.
 4. After smoke success and exclusive ownership proof, set `sunny-24` to `ACTIVE` and read back its next run.
 5. On every scheduled run, execute the normal three-day job scan, deterministic gates, evaluation, queue processing, Sheet publication, and private local archive update.
-6. Attempt the Brave LinkedIn step. Process stored, unexpired pending profiles first, then new observations, under the shared 20-profile/10-minute cap.
+6. Attempt the Brave LinkedIn step. Generate and consume the deterministic worklist so stored, unexpired pending profiles run before new observations under the shared 20-profile/10-minute cap.
 7. If unauthenticated/challenged, skip without login and recompute expiry from retained verified connections.
 8. Rebuild localhost `jobs.json` with fresh base jobs and optional referral enrichment/cached fallback.
 9. Verify schema, unique `matchKey`, canonical URLs, privacy retention, and newly matched contacts.
@@ -222,6 +230,7 @@ Google Sheet behavior remains unchanged by this feature. No referral contact is 
 | LinkedIn logged out | `linkedin_not_authenticated`; do not log in; preserve data |
 | LinkedIn challenge/CAPTCHA | `linkedin_challenge`; stop LinkedIn actions; preserve data |
 | UI layout cannot be parsed | `partial` or `error`; preserve prior verified contacts |
+| Partial/incomplete profile parse | may remain pending/unresolved; never downgrade prior verified employment |
 | Profile lacks verifiable current Experience | mark `unresolved`; do not match |
 | Former employer only | mark `not_current`; do not match |
 | Ambiguous company identity | no match; record unresolved evidence |
@@ -233,8 +242,8 @@ LinkedIn failure never changes job qualification, score, priority, queue disposi
 
 ## Testing strategy
 
-- Unit-test referral schema validation, URL canonicalization, multiple-current-employment handling, exact company URL matching, reviewed aliases, raw-name rejection, former-employee rejection, dual 14-day inclusivity, relative-date ranges, retention, and `matchKey` deduplication.
-- Unit-test snapshot enrichment and fresh-base publication when referral JSON is absent or invalid.
+- Unit-test referral schema validation/unknown-field rejection, URL canonicalization, multiple-current-employment handling, partial-vs-complete merge semantics, exact company URL matching, reviewed aliases, raw-name rejection, former-employee rejection, dual 14-day inclusivity, deterministic 20/20/10 worklist selection, relative-date ranges, retention, and date-qualified `matchKey` deduplication.
+- Unit-test snapshot enrichment, repeated URL across recent/expired dates, mode `0600`, and fresh-base publication when referral JSON is absent or invalid.
 - Unit-test the `只看有內推人` state wiring and add a Playwright test that toggles it, inspects rendered contacts, validates no-referrer profile links, and checks both copy payloads.
 - Add normalized capture fixtures for authenticated Connections, logged-out redirect, challenge page, multiple current roles, former-only Experience, ambiguous employer, prompt-injection text, first run, and relative dates.
 - Test that 50 pending profiles drain 20/20/10 without starvation.
