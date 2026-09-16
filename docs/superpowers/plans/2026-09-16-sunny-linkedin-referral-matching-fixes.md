@@ -114,3 +114,18 @@ git diff --check
 - [ ] Audit: state/snapshot/temp files mode `0600`; state and local implementation remain ignored; no PII in tracked diffs/logs; no Sheet referral data; no message/connect/apply/login path; one active scheduler owner only.
 - [ ] Report exact test counts, Brave source status, pending/verified/match counts, live localhost header check, automation status/next run, and any remaining blocker. Do not claim completion if any checkbox or readback is missing.
 
+---
+
+## Parent-review delta after the first repair pass
+
+The first repair pass added the browser test and fixed the primary retention/matcher behavior, but the parent review did not approve it because several required contracts are still untested or shallowly validated. Complete every item below before returning to Task 5 or claiming the local gate is meaningful.
+
+- [ ] Add and pass a test named `rejects invalid date precision and strict nested match fields`. Accepted precision is exactly `day`, `relative_day`, `relative_week`, or `unknown`. Reject `calendar_day`, undeclared connection/employment/match fields, malformed match/profile/application URLs, mismatched date-qualified `matchKey`, invalid `jobScanDate`, and invalid match date ranges. Migrate the smoke state precision from `calendar_day` to `day` through a validated atomic write.
+- [ ] Add and pass a test named `validates the full reviewed company map contract`. Cover missing/reordered headers, invalid company URL, company/people slug mismatch, invalid verification date/status, a conflicting normalized key, and two legitimate reviewed keys sharing one parent URL.
+- [ ] Add and pass tests named `merges complete partial observations safely` and `completed inspection can replace or retire prior employment`. Cover complete-new verified, complete employer change, completed not-current, incomplete non-downgrade, and skip preservation.
+- [ ] Add and pass a test named `drains fifty pending profiles through production cycles as 20 20 10`. It must call the real selector and real merge path between batches; direct slicing assertions are insufficient.
+- [ ] Add and pass a test named `runCli honors data-root precedence and strict temporary inputs`. Exercise the actual CLI implementation for default and both environment overrides, verify relative private paths resolve under the selected root, reject escapes, reject malformed candidate fields, and verify candidate/worklist output mode `0600`. If marker precedence cannot be isolated safely, copy the minimal module/resolver into a temporary fixture root and test it there—never mutate the live marker without exact backup/restore.
+- [ ] Add JSON fixtures under `local/sunny-job-search/tests/fixtures/referrals/` and load them from tests for at least: complete current, partial pending, challenge, repeated URL, and prompt-injection text. The injection string must remain inert data and never reach command/path/action fields.
+- [ ] Add and pass builder tests named `invalid existing referral state carries only bounded validated cache` and `invalid cached contacts are discarded`. Cover malformed JSON, syntactically valid malformed schema, exact date+URL identity, 14-day job/connection gates, 90-day PII TTL, malformed LinkedIn URL, unknown fields, and fresh unrelated jobs. Add a mode-`0600` replacement assertion.
+- [ ] Replace `validReferralState()` shallow checks in the builder with the same strict referral-state contract used by the referral module, or a shared exported validator. Do not maintain divergent validators.
+- [ ] Rerun the fail-fast `&&` gate only after the named tests above are visible in the test output. Keep `sunny-24` paused until the parent approves this delta.
