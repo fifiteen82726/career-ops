@@ -44,17 +44,18 @@ Add a house rule to `modes/_custom.md` requiring every future tailored-resume ru
 
 ## Initial data
 
-Seed four rows for the verified Fivetran and NBCUniversal resumes:
+Seed five rows for the verified Fivetran, NBCUniversal, and Zuora resumes:
 
 1. Fivetran - Senior Data Analyst, People - official job URL - shared verified one-page A4 Fivetran PDF.
 2. Fivetran - Senior Data Analyst, Revenue - official job URL - shared verified one-page A4 Fivetran PDF.
 3. NBCUniversal - Sr. Analyst, Content Forecasting - archived JD reference - corresponding verified PDF.
 4. NBCUniversal - Analyst, People Analytics & Reporting - archived JD reference - corresponding verified PDF.
+5. Zuora - Sr. Analyst, Revenue Operations and Analytics - official Greenhouse job URL - corresponding verified PDF.
 
 ## Verification
 
 - The TSV header matches the defined five-column schema.
-- All four seeded rows have five fields. The two Fivetran rows use their official job URLs and share the existing verified Fivetran PDF; the NBCUniversal rows point to existing JD and PDF files.
+- All five seeded rows have five fields. The two Fivetran rows use their official job URLs and share the existing verified Fivetran PDF; the NBCUniversal rows point to existing JD and PDF files; the Zuora row uses its official Greenhouse URL and verified PDF.
 - Re-running the seeding logic would add zero exact duplicates.
 - `modes/_custom.md` contains the persistent write and lookup rules.
 - No tracker state is changed and no application is marked submitted.
