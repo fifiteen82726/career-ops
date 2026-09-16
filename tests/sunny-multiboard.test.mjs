@@ -121,6 +121,43 @@ test('same board via aliases backfills once, distinct board twice, all anchored 
   assert.equal(saved.every(row => row.backfill_window_start === '2026-08-21'), true);
 });
 
+test('backfill deadline is checked before claim and maxBoards bounds work', async t => {
+  const dataRoot = mkdtempSync(join(tmpdir(), 'sunny-backfill-deadline-'));
+  t.after(() => rmSync(dataRoot, { recursive: true, force: true }));
+  mkdirSync(join(dataRoot, 'profiles'));
+  writeFileSync(join(dataRoot, 'profiles/sunny-company-discovery.yml'), 'scan:\n  backfill_days: 20\n');
+  const rows = (await resolveCompanyLeads(args)).map(row => ({ ...row, backfill_status: 'pending' }));
+  await updateResolutionRows(rows, { dataRoot });
+  const expired = await runPendingBackfills({ dataRoot, now: '2026-09-09T06:00:00Z',
+    deadlineAt: '2026-09-09T05:59:00Z', ignoreGuard: true, scan: async () => { throw new Error('must not scan'); } });
+  assert.equal(expired.started, 0);
+  assert.equal(expired.deferred_deadline, true);
+  assert.equal(readResolutionRows({ dataRoot }).every(row => row.backfill_status === 'pending'), true);
+  const bounded = await runPendingBackfills({ dataRoot, now: '2026-09-09T06:00:00Z', ignoreGuard: true,
+    maxBoards: 1, scan: async () => ({ completion_status: 'complete' }) });
+  assert.equal(bounded.started, 1);
+  assert.equal(readResolutionRows({ dataRoot }).filter(row => row.backfill_status === 'running').length, 0);
+});
+
+test('a deadline reached during a board leaves claimed rows safely retryable', async t => {
+  const dataRoot = mkdtempSync(join(tmpdir(), 'sunny-backfill-interrupted-'));
+  t.after(() => rmSync(dataRoot, { recursive: true, force: true }));
+  mkdirSync(join(dataRoot, 'profiles'));
+  writeFileSync(join(dataRoot, 'profiles/sunny-company-discovery.yml'), 'scan:\n  backfill_days: 20\n');
+  const [row] = await resolveCompanyLeads({ ...args, candidates: [candidate('example')] });
+  await updateResolutionRows([row], { dataRoot });
+  let time = Date.parse('2026-09-09T06:00:00Z');
+  const result = await runPendingBackfills({ dataRoot, now: new Date(time), ignoreGuard: true,
+    deadlineAt: new Date(time + 1_000), clock: () => new Date(time), scan: async () => {
+      time += 2_000;
+      return { completion_status: 'complete' };
+    } });
+  assert.equal(result.partial, 1);
+  const [saved] = readResolutionRows({ dataRoot });
+  assert.equal(saved.backfill_status, 'retry_partial');
+  assert.match(saved.backfill_error, /deadline/i);
+});
+
 test('failed portal commit does not invalidate a board another resolver already committed', async t => {
   const dataRoot = mkdtempSync(join(tmpdir(), 'sunny-commit-failure-'));
   t.after(() => rmSync(dataRoot, { recursive: true, force: true }));

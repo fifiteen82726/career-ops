@@ -20,6 +20,7 @@ import { isMainModule } from '../../lib/is-main-module.mjs';
 import { portalEntryBoardKey, portalBoardKey } from './sunny-company-expansion.mjs';
 import { statePaths } from './sunny-company-state.mjs';
 import { enqueueScanReceipt } from './sunny-job-queue.mjs';
+import { withSunnyRoutineLease } from './sunny-routine-runtime.mjs';
 
 const CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const PARTIAL_PATTERN = /\b(?:partial|truncat(?:ed|ion)?|page cap|max_pages|budget exhausted)\b/i;
@@ -125,6 +126,7 @@ export async function runSerializedScan({
   runChild = defaultRunChild,
   now = new Date(),
   lockOptions,
+  routineLease = kind === 'daily',
 } = {}) {
   if (!['daily', 'backfill'].includes(kind)) throw new Error('scan kind must be daily or backfill');
   if (kind === 'backfill') {
@@ -136,7 +138,7 @@ export async function runSerializedScan({
     throw new Error('daily since must be a positive number');
   }
 
-  return withSunnyScanLock(async (paths) => {
+  const execute = () => withSunnyScanLock(async (paths) => {
     const historyPath = join(paths.root, 'data/sunny-scan-history.tsv');
     const pipelinePath = join(paths.root, 'data/sunny-pipeline.md');
     mkdirSync(paths.receipts, { recursive: true });
@@ -225,6 +227,11 @@ export async function runSerializedScan({
     }
     return { ...receipt, receipt_path: receiptPath };
   }, { dataRoot, lockOptions });
+  // Company backfills run under their parent's lease. Reacquiring here would
+  // deadlock the exact-board child against the company run that owns it.
+  return routineLease
+    ? withSunnyRoutineLease('daily', () => execute(), { dataRoot, lockOptions })
+    : execute();
 }
 
 function valueOf(args, flag) {

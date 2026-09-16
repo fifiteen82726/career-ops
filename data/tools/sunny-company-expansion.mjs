@@ -1323,7 +1323,17 @@ export async function runPendingBackfills({
   now = new Date(),
   ignoreGuard = false,
   scan,
+  deadlineAt,
+  maxBoards = Infinity,
+  signal,
+  clock = () => new Date(),
 } = {}) {
+  const normalizedDeadline = deadlineAt == null ? null : new Date(deadlineAt);
+  if (normalizedDeadline && Number.isNaN(normalizedDeadline.getTime())) throw new Error('deadlineAt must be a valid timestamp');
+  const boardLimit = Number(maxBoards);
+  if (!(boardLimit === Infinity || (Number.isInteger(boardLimit) && boardLimit >= 1))) {
+    throw new Error('maxBoards must be a positive integer or Infinity');
+  }
   const paths = statePaths(dataRoot);
   const config = readYaml(paths.config);
   const guardMinutes = Number(config.scan?.pre_noon_guard_minutes || 30);
@@ -1331,11 +1341,16 @@ export async function runPendingBackfills({
     return { started: 0, complete: 0, partial: 0, error: 0, deferred_pre_noon: true };
   }
   const attempted = new Set();
-  const totals = { started: 0, complete: 0, partial: 0, error: 0, deferred_pre_noon: false };
+  const totals = { started: 0, complete: 0, partial: 0, error: 0, deferred_pre_noon: false, deferred_deadline: false };
   const { runSerializedScan } = await import('./run-sunny-serialized-scan.mjs');
   const scanner = scan || runSerializedScan;
 
   for (;;) {
+    if (signal?.aborted || (normalizedDeadline && clock() >= normalizedDeadline)) {
+      totals.deferred_deadline = true;
+      break;
+    }
+    if (totals.started >= boardLimit) break;
     let claimed = null;
     let claimedKeys = new Set();
     await updateResolutionRows(current => {
@@ -1371,6 +1386,7 @@ export async function runPendingBackfills({
     totals.started += 1;
 
     let scanResult;
+    let completion = 'error';
     try {
       scanResult = await scanner({
         kind: 'backfill',
@@ -1380,19 +1396,27 @@ export async function runPendingBackfills({
         postedAfter: claimed.backfill_window_start,
         postedBefore: claimed.backfill_window_end,
       });
+      if (signal?.aborted || (normalizedDeadline && clock() >= normalizedDeadline)) {
+        scanResult = { completion_status: 'partial', error: 'deadline reached during exact-board backfill' };
+        totals.deferred_deadline = true;
+      }
+      completion = scanResult.completion_status || 'error';
     } catch (error) {
       scanResult = { completion_status: 'error', error: clean(error?.message || error) };
+      completion = 'error';
+    } finally {
+      // A claimed row is never allowed to survive this unit as `running`.
+      // This includes scanner errors, deadline deferrals, and write failures.
+      await updateResolutionRows(current => current.map(row => (
+        claimedKeys.has(resolutionRowKey(row)) && row.backfill_status === 'running'
+          ? finishBackfill(row, {
+            status: completion,
+            error: scanResult?.error || scanResult?.warnings?.join('; ') || '',
+          })
+          : row
+      )), { dataRoot });
     }
-    const completion = scanResult.completion_status || 'error';
     totals[completion] += 1;
-    await updateResolutionRows(current => current.map(row => (
-      claimedKeys.has(resolutionRowKey(row)) && row.backfill_status === 'running'
-        ? finishBackfill(row, {
-          status: completion,
-          error: scanResult.error || scanResult.warnings?.join('; ') || '',
-        })
-        : row
-    )), { dataRoot });
   }
   return totals;
 }
