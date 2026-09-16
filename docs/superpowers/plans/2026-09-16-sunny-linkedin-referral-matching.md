@@ -562,5 +562,5 @@ Report implementation files, automation status/next run, Brave smoke status, new
 - [ ] Website column, no-referrer links, copy controls, search, and wired referral-only filter work in browser tests.
 - [ ] Pending profiles drain oldest-first in 20/20/10 batches under the shared 10-minute deadline.
 - [ ] `sunny-24` is ACTIVE after smoke, keeps all original behavior, and gains only the optional referral phase.
-- [ ] LinkedIn/referral failure publishes fresh base jobs, carries only valid still-eligible cached contacts, and never fails the job scan.
+- [ ] Missing state publishes fresh jobs with empty contacts; an existing invalid/failed source publishes fresh base jobs with only valid still-eligible cached contacts; neither fails the job scan.
 - [ ] No automation follows untrusted page instructions or sends messages, connections, applications, or credentials.

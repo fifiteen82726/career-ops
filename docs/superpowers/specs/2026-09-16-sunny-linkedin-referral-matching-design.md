@@ -185,7 +185,7 @@ Each enriched job receives:
 }
 ```
 
-Jobs without a match receive an empty array. Snapshot enrichment joins only on exact `jobScanDate|canonicalApplyUrl` and rechecks the row date, so a recent match can never attach to an older row sharing the same URL. `lastObservedAt` is retained in the local contact record solely to enforce the 90-day PII limit during fallback; the UI does not display it. An invalid job archive preserves the entire prior `jobs.json`. Missing or invalid optional referral state must not block fresh job data: rebuild the base snapshot, carry forward only previously validated cached contacts for the same date-qualified job identities that remain inside both 14-day windows and whose `lastObservedAt` is within 90 days, and set `referralDataStatus` to the skip/error state. Invalid optional referral data never freezes unrelated jobs. Snapshot replacement is atomic and mode `0600`.
+Jobs without a match receive an empty array. Snapshot enrichment joins only on exact `jobScanDate|canonicalApplyUrl` and rechecks the row date, so a recent match can never attach to an older row sharing the same URL. `lastObservedAt` is retained in the local contact record solely to enforce the 90-day PII limit during fallback; the UI does not display it. An invalid job archive preserves the entire prior `jobs.json`. A missing optional referral state is treated as intentional/not configured: rebuild fresh base jobs with empty contacts and `referralDataStatus: not_configured`; do not resurrect prior contacts. An existing but invalid referral state also rebuilds fresh base jobs, but may carry forward only previously validated cached contacts for the same date-qualified job identities that remain inside both 14-day windows and whose `lastObservedAt` is within 90 days, with `referralDataStatus: error`. Invalid optional referral data never freezes unrelated jobs. Snapshot replacement is atomic and mode `0600`.
 
 ### 5. Local website behavior
 
@@ -234,6 +234,7 @@ Google Sheet behavior remains unchanged by this feature. No referral contact is 
 | Profile lacks verifiable current Experience | mark `unresolved`; do not match |
 | Former employer only | mark `not_current`; do not match |
 | Ambiguous company identity | no match; record unresolved evidence |
+| Referral JSON absent | publish fresh base jobs with empty contacts; mark `not_configured`; do not use cache |
 | Referral JSON invalid | publish fresh base jobs; carry only validated still-eligible cached contacts; mark referral error |
 | Website rebuild fails | preserve previous `jobs.json`; report failure |
 | Conflicting active Grok job writer | do not activate Codex; report scheduler ownership blocker |
@@ -243,7 +244,7 @@ LinkedIn failure never changes job qualification, score, priority, queue disposi
 ## Testing strategy
 
 - Unit-test referral schema validation/unknown-field rejection, URL canonicalization, multiple-current-employment handling, partial-vs-complete merge semantics, exact company URL matching, reviewed aliases, raw-name rejection, former-employee rejection, dual 14-day inclusivity, deterministic 20/20/10 worklist selection, relative-date ranges, retention, and date-qualified `matchKey` deduplication.
-- Unit-test snapshot enrichment, repeated URL across recent/expired dates, mode `0600`, and fresh-base publication when referral JSON is absent or invalid.
+- Unit-test snapshot enrichment, repeated URL across recent/expired dates, mode `0600`, missing-state empty/no-cache behavior, and invalid-state bounded cached fallback.
 - Unit-test the `只看有內推人` state wiring and add a Playwright test that toggles it, inspects rendered contacts, validates no-referrer profile links, and checks both copy payloads.
 - Add normalized capture fixtures for authenticated Connections, logged-out redirect, challenge page, multiple current roles, former-only Experience, ambiguous employer, prompt-injection text, first run, and relative dates.
 - Test that 50 pending profiles drain 20/20/10 without starvation.
