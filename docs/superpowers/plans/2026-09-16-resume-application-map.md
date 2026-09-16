@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Persist an exact, append-only pairing between each job application reference and the verified PDF resume prepared for it, beginning with the two existing NBCUniversal resumes.
+**Goal:** Persist an exact, append-only pairing between each job application reference and the verified PDF resume prepared for it, beginning with the two Fivetran applications and two NBCUniversal applications already prepared.
 
 **Architecture:** Keep all personalized state in the career-ops user layer. Store mappings in a five-column TSV under `data/`, and store the future write/lookup behavior as a house rule in `modes/_custom.md`. Do not add tracker state, infer submission, or modify system-layer resume-generation code.
 
@@ -14,6 +14,9 @@
 
 **Files:**
 - Create: `data/resume-application-map.tsv`
+- Read: `jds/fivetran-senior-data-analyst-people-2026-09-09.md`
+- Read: `jds/fivetran-senior-data-analyst-revenue-2026-09-09.md`
+- Read: `output/cv-yi-yun-liao-fivetran-senior-data-analyst-balanced-a4-2026-09-13.pdf`
 - Read: `jds/nbcuniversal-sr-analyst-content-forecasting-2026-09-14.md`
 - Read: `jds/nbcuniversal-analyst-people-analytics-reporting-2026-09-11.md`
 - Read: `output/pdf/cv-yi-yun-liao-nbcuniversal-sr-analyst-content-forecasting-balanced-a4-2026-09-16.pdf`
@@ -34,6 +37,9 @@ Expected: exit 0. If the file exists, inspect it and merge only missing rows ins
 Run each command separately:
 
 ```bash
+test -f jds/fivetran-senior-data-analyst-people-2026-09-09.md
+test -f jds/fivetran-senior-data-analyst-revenue-2026-09-09.md
+test -f output/cv-yi-yun-liao-fivetran-senior-data-analyst-balanced-a4-2026-09-13.pdf
 test -f jds/nbcuniversal-sr-analyst-content-forecasting-2026-09-14.md
 test -f jds/nbcuniversal-analyst-people-analytics-reporting-2026-09-11.md
 test -f output/pdf/cv-yi-yun-liao-nbcuniversal-sr-analyst-content-forecasting-balanced-a4-2026-09-16.pdf
@@ -48,6 +54,8 @@ Use `apply_patch` to create `data/resume-application-map.tsv` with literal tab s
 
 ```text
 created_at\tcompany\tjob_title\tapplication_ref\tpdf_resume
+2026-09-15\tFivetran\tSenior Data Analyst, People\thttps://www.fivetran.com/careers/job?gh_jid=7918612003\toutput/cv-yi-yun-liao-fivetran-senior-data-analyst-balanced-a4-2026-09-13.pdf
+2026-09-15\tFivetran\tSenior Data Analyst, Revenue\thttps://www.fivetran.com/careers/job?gh_jid=7918614003\toutput/cv-yi-yun-liao-fivetran-senior-data-analyst-balanced-a4-2026-09-13.pdf
 2026-09-16\tNBCUniversal\tSr. Analyst, Content Forecasting\tjds/nbcuniversal-sr-analyst-content-forecasting-2026-09-14.md\toutput/pdf/cv-yi-yun-liao-nbcuniversal-sr-analyst-content-forecasting-balanced-a4-2026-09-16.pdf
 2026-09-16\tNBCUniversal\tAnalyst, People Analytics & Reporting\tjds/nbcuniversal-analyst-people-analytics-reporting-2026-09-11.md\toutput/pdf/cv-yi-yun-liao-nbcuniversal-analyst-people-analytics-reporting-balanced-a4-2026-09-16.pdf
 ```
@@ -59,10 +67,10 @@ The displayed `\t` markers above mean one literal tab in the file, not two chara
 Run:
 
 ```bash
-node -e 'const fs=require("fs"); const p="data/resume-application-map.tsv"; const lines=fs.readFileSync(p,"utf8").trimEnd().split(/\r?\n/); const expected="created_at\tcompany\tjob_title\tapplication_ref\tpdf_resume"; if(lines[0]!==expected) throw new Error("wrong header"); if(lines.length!==3) throw new Error(`expected 2 rows, got ${lines.length-1}`); const rows=lines.slice(1).map((line,i)=>{const f=line.split("\t"); if(f.length!==5) throw new Error(`row ${i+2} has ${f.length} fields`); if(f.some(v=>!v.trim())) throw new Error(`row ${i+2} has an empty field`); return f;}); const keys=rows.map(r=>r.slice(1).join("\t")); if(new Set(keys).size!==keys.length) throw new Error("exact duplicate mapping"); for(const r of rows){for(const i of [3,4]) if(!fs.existsSync(r[i])) throw new Error(`missing path: ${r[i]}`);} console.log("resume map valid: 2 rows");'
+node -e 'const fs=require("fs"); const p="data/resume-application-map.tsv"; const lines=fs.readFileSync(p,"utf8").trimEnd().split(/\r?\n/); const expected="created_at\tcompany\tjob_title\tapplication_ref\tpdf_resume"; if(lines[0]!==expected) throw new Error("wrong header"); if(lines.length!==5) throw new Error(`expected 4 rows, got ${lines.length-1}`); const rows=lines.slice(1).map((line,i)=>{const f=line.split("\t"); if(f.length!==5) throw new Error(`row ${i+2} has ${f.length} fields`); if(f.some(v=>!v.trim())) throw new Error(`row ${i+2} has an empty field`); return f;}); const keys=rows.map(r=>r.slice(1).join("\t")); if(new Set(keys).size!==keys.length) throw new Error("exact duplicate mapping"); for(const r of rows){if(!/^https?:\/\//.test(r[3])&&!fs.existsSync(r[3])) throw new Error(`missing application ref: ${r[3]}`); if(!fs.existsSync(r[4])) throw new Error(`missing PDF: ${r[4]}`);} console.log("resume map valid: 4 rows");'
 ```
 
-Expected: `resume map valid: 2 rows`.
+Expected: `resume map valid: 4 rows`.
 
 ## Task 2: Make the behavior persistent for future resume and interview runs
 
@@ -116,10 +124,10 @@ Expected: the subsection includes final-verification timing, exact duplicate pre
 Run:
 
 ```bash
-node -e 'const fs=require("fs"); const p="data/resume-application-map.tsv"; const [header,...lines]=fs.readFileSync(p,"utf8").trimEnd().split(/\r?\n/); if(header!=="created_at\tcompany\tjob_title\tapplication_ref\tpdf_resume") throw new Error("schema mismatch"); const rows=lines.map(line=>line.split("\t")); if(rows.some(r=>r.length!==5)) throw new Error("non-five-column row"); const exact=new Set; for(const r of rows){const key=r.slice(1).join("\u0000"); if(exact.has(key)) throw new Error("duplicate tuple"); exact.add(key); if(!fs.existsSync(r[3])) throw new Error(`missing application ref ${r[3]}`); if(!fs.existsSync(r[4])) throw new Error(`missing PDF ${r[4]}`); console.log(`${r[1]} | ${r[2]} | ${r[3]} | ${r[4]}`);} if(rows.length!==2) throw new Error(`expected 2 seeded rows, got ${rows.length}`);'
+node -e 'const fs=require("fs"); const p="data/resume-application-map.tsv"; const [header,...lines]=fs.readFileSync(p,"utf8").trimEnd().split(/\r?\n/); if(header!=="created_at\tcompany\tjob_title\tapplication_ref\tpdf_resume") throw new Error("schema mismatch"); const rows=lines.map(line=>line.split("\t")); if(rows.some(r=>r.length!==5)) throw new Error("non-five-column row"); const exact=new Set; for(const r of rows){const key=r.slice(1).join("\u0000"); if(exact.has(key)) throw new Error("duplicate tuple"); exact.add(key); if(!/^https?:\/\//.test(r[3])&&!fs.existsSync(r[3])) throw new Error(`missing application ref ${r[3]}`); if(!fs.existsSync(r[4])) throw new Error(`missing PDF ${r[4]}`); console.log(`${r[1]} | ${r[2]} | ${r[3]} | ${r[4]}`);} if(rows.length!==4) throw new Error(`expected 4 seeded rows, got ${rows.length}`);'
 ```
 
-Expected: two NBCUniversal pairings print and the command exits 0.
+Expected: two Fivetran and two NBCUniversal pairings print and the command exits 0.
 
 - [ ] **Step 2: Confirm the tracker was not modified by this implementation**
 
@@ -154,7 +162,7 @@ Expected: valid JSON and no new missing prerequisite caused by this change.
 
 - [ ] **Step 5: Report the durable lookup path**
 
-Provide clickable links to `data/resume-application-map.tsv` and `modes/_custom.md`. State that both NBCUniversal job/resume pairs are recorded, historical PDF versions will be retained, and no application was marked submitted.
+Provide clickable links to `data/resume-application-map.tsv` and `modes/_custom.md`. State that both Fivetran and both NBCUniversal job/resume pairs are recorded, historical PDF versions will be retained, and no application was marked submitted.
 
 ## Self-review checklist
 
@@ -163,4 +171,3 @@ Provide clickable links to `data/resume-application-map.tsv` and `modes/_custom.
 - [ ] The map stays in the user layer and the workflow preference stays in `modes/_custom.md`.
 - [ ] There are no placeholder paths, invented URLs, or unverified job identifiers.
 - [ ] The five TSV fields and duplicate key are consistent across creation, validation, and future workflow rules.
-
