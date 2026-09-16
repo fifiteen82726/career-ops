@@ -109,7 +109,7 @@ Expected: parseability at least 90/100 and supported-keyword coverage no lower t
 Immediately before the first PDF render, run exactly:
 
 ```bash
-node /Users/coda/.codex/plugins/cache/openai-primary-runtime/pdf/26.904.11930/skills/pdf/container_tools/mark_artifact_operation_started.mjs --operation-kind create --expected-output-count 3 --output-format pdf
+node "$CODEX_HOME/plugins/cache/openai-primary-runtime/pdf/26.904.11930/skills/pdf/container_tools/mark_artifact_operation_started.mjs" --operation-kind create --expected-output-count 3 --output-format pdf
 ```
 
 Expected: exit code 0. Do not run this marker again during the same three-PDF authoring operation.

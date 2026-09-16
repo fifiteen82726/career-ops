@@ -507,7 +507,7 @@ Expected: both checks exit zero.
 Run exactly once before rendering:
 
 ```bash
-node /Users/coda/.codex/plugins/cache/openai-primary-runtime/pdf/26.904.11930/skills/pdf/container_tools/mark_artifact_operation_started.mjs \
+node "$CODEX_HOME/plugins/cache/openai-primary-runtime/pdf/26.904.11930/skills/pdf/container_tools/mark_artifact_operation_started.mjs" \
   --operation-kind create --expected-output-count 1 --output-format pdf
 ```
 
