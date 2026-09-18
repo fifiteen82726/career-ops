@@ -101,7 +101,7 @@ Do not define `REMOTE_SYSTEM_SHA` yet. Task 3 changes tracked runtime code; the 
 
 - [ ] Validate every JSON file, the `portals.yml` schema, and the TSV headers in the allowlist. Record for every allowlisted file: relative path, byte size, SHA-256, and for TSV/JSON state its row/item/status counts. Required queue counts are `pending`, `published`, `rejected`, `duplicate`, and `closed`; required resolution counts are grouped by `status` and `backfill_status`; required ATS cache counts are grouped by provider/status/freshness.
 
-- [ ] Confirm `data/sunny-job-sheet.json` contains the supplied spreadsheet ID and `yiyunliao0321@gmail.com`.
+- [ ] Confirm `data/sunny-job-sheet.json` contains the supplied spreadsheet ID and `yiyunliao21@gmail.com`.
 
 ---
 

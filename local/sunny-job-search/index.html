@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Sunny Global Job Search</title><link rel="stylesheet" href="./styles.css"></head>
+<body>
+  <main>
+    <header><p class="eyebrow">LOCAL ONLY · SUNNY JOB SEARCH</p><h1>合適職缺總覽</h1><p>在保留的每日掃描結果中搜尋，不需要登入 Google Sheet。</p></header>
+    <section class="controls" aria-label="搜尋與篩選">
+      <label class="search">全域搜尋<input id="query" type="search" placeholder="公司、職缺、地點、內推訊息…" autocomplete="off"></label>
+      <fieldset><legend>優先序</legend><label><input type="checkbox" data-priority="priority" checked> 優先投遞</label><label><input type="checkbox" data-priority="suggested" checked> 建議投遞</label><label><input type="checkbox" data-priority="low"> 低優先</label></fieldset>
+      <label class="referral-filter"><input id="referrals-only" type="checkbox"> 只看有內推人</label>
+      <label>開始日期<input id="start-date" type="date"></label><label>結束日期<input id="end-date" type="date"></label>
+      <div class="ranges" aria-label="快速日期範圍"><button type="button" data-range="7" class="active" aria-pressed="true">最近 7 天</button><button type="button" data-range="14" aria-pressed="false">14 天</button><button type="button" data-range="21" aria-pressed="false">21 天</button><button type="button" data-range="30" aria-pressed="false">30 天</button></div>
+    </section>
+    <p id="load-error" class="error" role="alert" hidden></p><p id="notice" class="notice" aria-live="polite"></p><p id="referral-status" class="referral-status" aria-live="polite"></p>
+    <section class="results"><div class="result-heading"><h2>適合職缺</h2><output id="result-count"></output></div><div class="table-wrap"><table><thead><tr>
+      <th class="sticky date" data-sort="scanDate" data-label="掃描日期" aria-sort="none"><button type="button" data-sort="scanDate">掃描日期 ↕</button></th><th class="sticky priority" data-sort="priority" data-label="優先序" aria-sort="none"><button type="button" data-sort="priority">優先序 ↕</button></th><th data-sort="score" data-label="推薦分數" aria-sort="none"><button type="button" data-sort="score">推薦分數 ↕</button></th><th class="sticky recommendation">建議</th><th>公司</th><th>職缺</th><th>分類</th><th>地點</th><th>工作模式</th><th>發布日期</th><th>主要缺口</th><th>使用履歷</th><th>申請連結</th><th>LinkedIn People</th><th>近期內推人</th><th>內推訊息</th>
+    </tr></thead><tbody></tbody></table></div></section>
+    <section id="recent-connections" class="connections" aria-labelledby="connections-title">
+      <div class="result-heading"><div><h2 id="connections-title">最近 Connections</h2><p>最近 14 天連線，且目前公司有適合職缺</p></div><output id="connections-count"></output></div>
+      <div id="connections-list" class="connections-list"></div>
+      <p id="connections-empty" class="connections-empty" hidden>目前的篩選條件下沒有可內推職缺。</p>
+    </section>
+    <dialog id="referral-dialog" class="referral-dialog" aria-labelledby="referral-dialog-title">
+      <div class="dialog-heading"><div><h2 id="referral-dialog-title">編輯內推訊息</h2><p id="referral-dialog-context"></p></div><button id="referral-dialog-close" type="button" class="dialog-close" aria-label="關閉">✕</button></div>
+      <label for="referral-message-editor">訊息內容</label><textarea id="referral-message-editor"></textarea>
+      <div class="dialog-actions"><button id="referral-dialog-cancel" type="button">取消</button><button id="referral-dialog-copy" type="button" class="primary-action">複製訊息</button></div>
+    </dialog>
+  </main><script type="module" src="./app.js"></script>
+</body></html>
