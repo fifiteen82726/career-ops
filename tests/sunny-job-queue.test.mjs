@@ -4,6 +4,11 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import * as queue from '../data/tools/sunny-job-queue.mjs';
+import {
+  deferCandidateFailure,
+  resolveCandidateException,
+} from '../data/tools/sunny-job-exception-queue.mjs';
+import { readExceptionQueue, recordFailure } from '../data/tools/sunny-exception-store.mjs';
 
 function root(t) {
   const dataRoot = mkdtempSync(join(tmpdir(), 'sunny-job-queue-'));
@@ -195,4 +200,161 @@ test('terminal jobs cannot be deferred for an exception', async t => {
     queue.deferJobForException({ url, exception_key: 'manual-review' }, { dataRoot }),
     /terminal disposition/i,
   );
+});
+
+test('a JD fetch failure creates one candidate exception and removes only that job from normal work', async t => {
+  const dataRoot = root(t);
+  const otherUrl = 'https://example.com/careers?gh_jid=456';
+  await queue.enqueueScanReceipt({ ...receipt,
+    scan_receipt: { ...receipt.scan_receipt, added_urls: [url, otherUrl] },
+  }, { dataRoot });
+
+  const failure = {
+    url,
+    stage: 'jd',
+    message: 'fetch failed',
+    evidence: { status: 503 },
+  };
+  const first = await deferCandidateFailure(failure, {
+    dataRoot,
+    now: '2026-09-23T12:00:00.000Z',
+  });
+  const replay = await deferCandidateFailure(failure, {
+    dataRoot,
+    now: '2026-09-23T12:00:00.000Z',
+  });
+
+  const key = `candidate|jd|${url}`;
+  assert.equal(first.key, key);
+  assert.equal(replay.key, key);
+  assert.deepEqual(queue.readPendingJobs({ dataRoot }).map(job => job.url), [otherUrl]);
+  const exceptions = readExceptionQueue({ dataRoot, queue: 'candidate' });
+  assert.equal(exceptions.length, 1);
+  assert.equal(exceptions[0].key, key);
+  assert.equal(exceptions[0].attempt_count, 1, 'a receipt replay cannot count the same candidate failure twice');
+});
+
+test('a deferred candidate replay without a supplied clock keeps its original attempt count', async t => {
+  const dataRoot = root(t);
+  await queue.enqueueScanReceipt(receipt, { dataRoot });
+  const failure = { url, stage: 'jd', message: 'fetch failed' };
+
+  await deferCandidateFailure(failure, { dataRoot });
+  await deferCandidateFailure(failure, { dataRoot });
+
+  assert.equal(readExceptionQueue({ dataRoot, queue: 'candidate' })[0].attempt_count, 1);
+});
+
+test('resolving a JD candidate exception restores the matching job to normal evaluation', async t => {
+  const dataRoot = root(t);
+  await queue.enqueueScanReceipt(receipt, { dataRoot });
+  const key = `candidate|jd|${url}`;
+  await deferCandidateFailure({ url, stage: 'jd', message: 'fetch failed' }, {
+    dataRoot,
+    now: '2026-09-23T12:00:00.000Z',
+  });
+
+  const result = await resolveCandidateException({ url, stage: 'jd' }, { dataRoot });
+
+  assert.deepEqual(result, { key, status: 'resolved', released: true });
+  assert.deepEqual(queue.readPendingJobs({ dataRoot }).map(job => job.url), [url]);
+  assert.equal(readExceptionQueue({ dataRoot, queue: 'candidate' })[0].status, 'resolved');
+});
+
+test('replaying an already-resolved JD failure does not hide the job again', async t => {
+  const dataRoot = root(t);
+  const failedAt = '2026-09-23T12:00:00.000Z';
+  await queue.enqueueScanReceipt(receipt, { dataRoot });
+  const failure = { url, stage: 'jd', message: 'fetch failed', failed_at: failedAt };
+  await deferCandidateFailure(failure, { dataRoot });
+  await resolveCandidateException({ url, stage: 'jd' }, { dataRoot });
+
+  const replay = await deferCandidateFailure(failure, { dataRoot });
+
+  assert.equal(replay.exception.status, 'resolved');
+  assert.deepEqual(queue.readPendingJobs({ dataRoot }).map(job => job.url), [url]);
+});
+
+test('a resolved publication-stage replay reports its persisted non-pending job state', async t => {
+  const dataRoot = root(t);
+  const failedAt = '2026-09-23T12:00:00.000Z';
+  await queue.enqueueScanReceipt(receipt, { dataRoot });
+  const failure = { url, stage: 'publish', message: 'Sheet write failed', failed_at: failedAt };
+  await deferCandidateFailure(failure, { dataRoot });
+  await resolveCandidateException({ url, stage: 'publish' }, { dataRoot });
+
+  const replay = await deferCandidateFailure(failure, { dataRoot });
+
+  assert.equal(replay.job.status, 'exception');
+});
+
+test('resolving a closed candidate exception twice never reopens the confirmed-closed job', async t => {
+  const dataRoot = root(t);
+  await queue.enqueueScanReceipt(receipt, { dataRoot });
+  await deferCandidateFailure({ url, stage: 'jd', message: 'HTTP 404 job no longer available' }, { dataRoot });
+
+  const first = await resolveCandidateException({ url, stage: 'jd' }, { dataRoot });
+  const second = await resolveCandidateException({ url, stage: 'jd' }, { dataRoot });
+  const third = await resolveCandidateException({ url, stage: 'jd' }, { dataRoot });
+
+  assert.equal(first.released, false);
+  assert.equal(second.released, false);
+  assert.equal(third.released, false);
+  assert.equal(queue.readPendingJobs({ dataRoot }).length, 0);
+  const job = JSON.parse(readFileSync(join(dataRoot, 'data/sunny-job-queue.json'), 'utf8')).jobs[0];
+  assert.equal(job.status, 'exception');
+});
+
+test('a later closed failure replaces an earlier resolved retryable outcome', async t => {
+  const dataRoot = root(t);
+  await queue.enqueueScanReceipt(receipt, { dataRoot });
+  await deferCandidateFailure({
+    url, stage: 'jd', message: 'fetch failed', failed_at: '2026-09-23T12:00:00.000Z',
+  }, { dataRoot });
+  await resolveCandidateException({ url, stage: 'jd' }, { dataRoot });
+  await deferCandidateFailure({
+    url, stage: 'jd', message: 'HTTP 404 job no longer available', failed_at: '2026-09-24T12:00:00.000Z',
+  }, { dataRoot });
+
+  await resolveCandidateException({ url, stage: 'jd' }, { dataRoot });
+  const replay = await resolveCandidateException({ url, stage: 'jd' }, { dataRoot });
+
+  assert.equal(replay.released, false);
+  assert.equal(queue.readPendingJobs({ dataRoot }).length, 0);
+});
+
+test('a no-clock replay after exception persistence but before job deferral does not consume another retry', async t => {
+  const dataRoot = root(t);
+  const key = `candidate|jd|${url}`;
+  await queue.enqueueScanReceipt(receipt, { dataRoot });
+  await recordFailure({ key, stage: 'jd', message: 'fetch failed', failed_at: '2026-09-23T12:00:00.000Z' }, {
+    dataRoot,
+    queue: 'candidate',
+  });
+
+  await deferCandidateFailure({ url, stage: 'jd', message: 'fetch failed' }, { dataRoot });
+
+  assert.equal(readExceptionQueue({ dataRoot, queue: 'candidate' })[0].attempt_count, 1);
+});
+
+test('a resolve and a newer candidate failure cannot leave normal and exception queues contradictory', async t => {
+  const dataRoot = root(t);
+  await queue.enqueueScanReceipt(receipt, { dataRoot });
+  await deferCandidateFailure({
+    url, stage: 'jd', message: 'fetch failed', failed_at: '2026-09-23T12:00:00.000Z',
+  }, { dataRoot, lockOptions: { retryMs: 1, timeoutMs: 2_000 } });
+
+  await Promise.all([
+    resolveCandidateException({ url, stage: 'jd' }, { dataRoot, lockOptions: { retryMs: 1, timeoutMs: 2_000 } }),
+    deferCandidateFailure({
+      url, stage: 'jd', message: 'fetch failed again', failed_at: '2026-09-24T12:00:00.000Z',
+    }, { dataRoot, lockOptions: { retryMs: 1, timeoutMs: 2_000 } }),
+  ]);
+
+  const item = readExceptionQueue({ dataRoot, queue: 'candidate' })[0];
+  const job = JSON.parse(readFileSync(join(dataRoot, 'data/sunny-job-queue.json'), 'utf8')).jobs[0];
+  assert.equal(item.status, 'retryable');
+  assert.equal(item.attempt_count, 2);
+  assert.equal(job.status, 'exception');
+  assert.equal(job.exception_key, item.key);
 });

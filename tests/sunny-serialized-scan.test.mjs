@@ -12,6 +12,7 @@ import {
   withSunnyScanLock,
 } from '../data/tools/run-sunny-serialized-scan.mjs';
 import { readPendingJobs } from '../data/tools/sunny-job-queue.mjs';
+import { readExceptionQueue } from '../data/tools/sunny-exception-store.mjs';
 
 const validReceipt = { version: 'careerops.scan.receipt@1', errors: [], added_urls: [] };
 
@@ -141,4 +142,84 @@ test('backfill receipt is bound to the exact provider and board identifier', asy
   assert.equal(result.posted_before, '2026-09-08');
   assert.match(result.receipt_path, /data\/company-discovery\/receipts\//);
   assert.equal(readPendingJobs({ dataRoot }).length, 1, 'wrapper persists added URLs, not just a receipt');
+});
+
+test('a partial scan queues valid URLs and records its source failure independently', async t => {
+  const dataRoot = mkdtempSync(join(tmpdir(), 'sunny-partial-receipt-'));
+  t.after(() => rmSync(dataRoot, { recursive: true, force: true }));
+  mkdirSync(join(dataRoot, 'data'), { recursive: true });
+  const url = 'https://example.com/jobs/valid';
+
+  const result = await runSerializedScan({
+    kind: 'daily',
+    dataRoot,
+    since: 3,
+    now: new Date('2026-09-23T12:00:00.000Z'),
+    routineLease: false,
+    runChild: async () => ({
+      exitCode: 2,
+      stdout: JSON.stringify({
+        ...validReceipt,
+        added_urls: [url],
+        errors: [{ company: 'Example', error: 'HTTP 429' }],
+      }),
+      stderr: '',
+    }),
+  });
+
+  assert.deepEqual(result.scan_exceptions, { recorded: 1 });
+  assert.deepEqual(readPendingJobs({ dataRoot }).map(job => job.url), [url]);
+  const exceptions = readExceptionQueue({ dataRoot, queue: 'source' });
+  assert.equal(exceptions.length, 1);
+  assert.equal(exceptions[0].key, 'source|example|transient');
+  assert.equal(exceptions[0].stage, 'scan');
+  assert.equal(exceptions[0].message, 'HTTP 429');
+});
+
+test('a max-pages coverage warning creates a source coverage exception', async t => {
+  const dataRoot = mkdtempSync(join(tmpdir(), 'sunny-coverage-receipt-'));
+  t.after(() => rmSync(dataRoot, { recursive: true, force: true }));
+  mkdirSync(join(dataRoot, 'data'), { recursive: true });
+
+  const result = await runSerializedScan({
+    kind: 'daily',
+    dataRoot,
+    since: 3,
+    now: new Date('2026-09-23T12:00:00.000Z'),
+    routineLease: false,
+    runChild: async () => ({
+      exitCode: 0,
+      stdout: JSON.stringify({ ...validReceipt, warnings: [{ company: 'Example', warning: 'max-pages reached' }] }),
+      stderr: '',
+    }),
+  });
+
+  assert.deepEqual(result.scan_exceptions, { recorded: 1 });
+  assert.deepEqual(readExceptionQueue({ dataRoot, queue: 'source' }).map(item => item.key), [
+    'source|example|coverage',
+  ]);
+});
+
+test('string coverage warnings retain separate Workday board identities', async t => {
+  const dataRoot = mkdtempSync(join(tmpdir(), 'sunny-string-coverage-receipt-'));
+  t.after(() => rmSync(dataRoot, { recursive: true, force: true }));
+  mkdirSync(join(dataRoot, 'data'), { recursive: true });
+
+  await runSerializedScan({
+    kind: 'daily',
+    dataRoot,
+    since: 3,
+    now: new Date('2026-09-23T12:00:00.000Z'),
+    routineLease: false,
+    runChild: async () => ({
+      exitCode: 0,
+      stdout: JSON.stringify(validReceipt),
+      stderr: 'workday: Alpha Bank truncated at max_pages=100\nworkday: Beta Bank truncated at max_pages=100',
+    }),
+  });
+
+  assert.deepEqual(readExceptionQueue({ dataRoot, queue: 'source' }).map(item => item.key).sort(), [
+    'source|alphabank|coverage',
+    'source|betabank|coverage',
+  ]);
 });

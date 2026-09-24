@@ -20,6 +20,7 @@ import { isMainModule } from '../../lib/is-main-module.mjs';
 import { portalEntryBoardKey, portalBoardKey } from './sunny-company-expansion.mjs';
 import { statePaths } from './sunny-company-state.mjs';
 import { enqueueScanReceipt } from './sunny-job-queue.mjs';
+import { ingestScanReceiptExceptions } from './sunny-scan-exception-queue.mjs';
 import { withSunnyRoutineLease } from './sunny-routine-runtime.mjs';
 
 const CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -222,10 +223,13 @@ export async function runSerializedScan({
     if (!dryRun && scanReceipt?.version === 'careerops.scan.receipt@1' && Array.isArray(scanReceipt.added_urls)) {
       await enqueueScanReceipt(receipt, { dataRoot: paths.root });
     }
+    const scanExceptionResult = dryRun
+      ? { recorded: 0, dry_run: true }
+      : await ingestScanReceiptExceptions(receipt, { dataRoot: paths.root, lockOptions });
     if (temporaryPortals) {
       try { unlinkSync(temporaryPortals); } catch { /* preserve receipt even if cleanup races */ }
     }
-    return { ...receipt, receipt_path: receiptPath };
+    return { ...receipt, receipt_path: receiptPath, scan_exceptions: { recorded: scanExceptionResult.recorded } };
   }, { dataRoot, lockOptions });
   // Company backfills run under their parent's lease. Reacquiring here would
   // deadlock the exact-board child against the company run that owns it.
