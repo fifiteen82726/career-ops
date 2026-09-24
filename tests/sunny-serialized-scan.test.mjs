@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import * as yaml from 'js-yaml';
@@ -232,4 +232,5 @@ test('uses a caller-persisted scan id in the receipt', async t => {
     exitCode: 0, stdout: JSON.stringify({ ...validReceipt, added_urls: [], errors: [] }), stderr: '',
   }) });
   assert.equal(result.run_id, 'claimed-scan-id');
+  assert.equal(existsSync(join(dataRoot, 'local/sunny-job-search/data/scan-status.json')), true);
 });

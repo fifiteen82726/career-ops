@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { buildReferralMessage, defaultFilters, filterJobs, filterReferralJobs, groupReferralConnections, hasReferralContacts, quickRange, referralSearchText, sortJobs } from '../app.js';
+import { calendarRange, validStatusRow } from '../scan-status.js';
 
 const jobs = [
   { scanDate: '2026-09-15', priority: 'priority', priorityLabel: '優先投遞', score: 91, company: 'Garner Health', title: 'Senior Data Analyst', category: 'Data Analysis', location: 'New York', workMode: 'NYC hybrid', postedDate: '2026-09-14', primaryGap: 'Healthcare', resume: 'Data Analyst', recommendation: '立即投遞', referralMessage: 'Full referral text', applyUrl: 'https://apply.example/garner', recommendationUrl: 'https://apply.example/garner', linkedinPeopleUrl: '', referralContacts: [{ fullName: 'Example Person', currentEmployer: 'Garner Health', currentTitle: 'Data Engineer', profileUrl: 'https://www.linkedin.com/in/example/' }] },
@@ -72,4 +73,15 @@ test('referral message uses singular and plural wording and always includes the 
   assert.match(many, /following positions at Garner Health/);
   assert.match(many, /referring me for these roles/);
   assert.match(many, /- Analytics Engineer\n  https:\/\/apply\.example\/analytics/);
+});
+
+test('calendar quick ranges clear a previous rolling Today interval', () => {
+  const range = calendarRange(new Date('2026-09-24T16:00:00Z'), 7, 'America/New_York');
+  assert.equal(Object.hasOwn(range, 'windowStart'), false);
+  assert.equal(Object.hasOwn(range, 'windowEnd'), false);
+});
+
+test('malformed operational rows are rejected before rendering status', () => {
+  assert.equal(validStatusRow({ date: '2026-09-24', status: 'yellow', label: '有問題', summary: 'warning', issues: [] }), true);
+  assert.equal(validStatusRow({ date: '2026-09-24', status: 'yellow', label: '有問題', summary: 'warning', issues: 'not-an-array' }), false);
 });

@@ -25,6 +25,11 @@ test('buildSnapshot retains the latest 30 calendar days and suppresses duplicate
   assert.equal(snapshot.jobs[0].id, 'https://jobs.example.com/123');
 });
 
+test('invalid explicit and receipt timestamps fall through to the day-end fallback', () => {
+  const snapshot = buildSnapshot({ schemaVersion: 1, timeZone: 'America/New_York', jobs: [job({ scannedAt: 'not-a-date' })] }, new Date('2026-09-16T16:00:00Z'), null, [{ kind: 'daily', dry_run: false, started_at: 'also-not-a-date', scan_receipt: { added_urls: ['https://jobs.example.com/123'] } }]);
+  assert.equal(snapshot.jobs[0].scannedAtPrecision, 'day-end-fallback');
+});
+
 test('refreshSnapshot preserves an existing snapshot when the archive is malformed', () => {
   const dir = mkdtempSync(join(tmpdir(), 'sunny-builder-'));
   const archive = join(dir, 'archive.json');

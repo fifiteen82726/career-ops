@@ -7,4 +7,5 @@
 .scan-status .table-wrap table { min-width: 0; }
 .status-dot { display: inline-block; width: .75rem; height: .75rem; border-radius: 50%; vertical-align: middle; outline-offset: 3px; }
 .status-dot.green { background: #16803c; }.status-dot.yellow { background: #c98a00; }.status-dot.red { background: #c62929; }.status-dot.gray { background: #78808a; }
+.status-cell { position: relative; }.status-detail { display: none; position: absolute; z-index: 8; left: 0; top: 1.9rem; width: min(360px, 70vw); padding: 8px 10px; border-radius: 7px; background: #17262f; color: #fff; white-space: pre-line; font-size: .78rem; line-height: 1.35; box-shadow: 0 5px 18px #1028234d; }.status-dot:hover + .status-detail,.status-dot:focus + .status-detail { display: block; }
 .scan-status { margin-top: 2rem; }

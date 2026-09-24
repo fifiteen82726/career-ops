@@ -7,6 +7,7 @@ import { getCareerOpsRoot } from '../../path-resolver.mjs';
 import { acquirePipelineLock } from '../../pipeline-lock.mjs';
 import { isMainModule } from '../../lib/is-main-module.mjs';
 import { canonicalLeadUrl } from './sunny-company-leads.mjs';
+import { refreshScanStatusSnapshot } from './build-sunny-scan-status.mjs';
 
 function file(dataRoot) { return join(dataRoot, 'data/sunny-daily-run-state.json'); }
 function payloadFile(dataRoot, batchId) { return join(dataRoot, 'data', `sunny-daily-payload-${Buffer.from(batchId).toString('base64url')}.json`); }
@@ -50,6 +51,10 @@ async function update(dataRoot, fn, lockOptions) {
   try { const state = fn(read(dataRoot)); writeFileSync(temp, `${JSON.stringify(state, null, 2)}\n`); renameSync(temp, file(dataRoot)); return state; }
   finally { if (existsSync(temp)) unlinkSync(temp); lock.release(); }
 }
+function refreshStatusAfter(result, dataRoot, refreshStatus) {
+  try { refreshStatus({ dataRoot }); return result; }
+  catch (error) { return { ...result, status_snapshot_warning: String(error?.message || error) }; }
+}
 function batchFor(runId, batch) {
   if (!batch) return null;
   const members = [...new Set((batch.members || []).map(canonicalMember))];
@@ -90,13 +95,13 @@ export async function claimDailyScan({ dataRoot = getCareerOpsRoot(), now = new 
     return { ...state, claimed: true, scan_id };
   }, lockOptions).then(state => ({ claimed: state.claimed, scan_id: state.scan_id, state: (() => { delete state.claimed; delete state.scan_id; return state; })() }));
 }
-export async function recordDailyScanReceipt({ dataRoot = getCareerOpsRoot(), scanId, receiptPath, receipt, lockOptions } = {}) {
+export async function recordDailyScanReceipt({ dataRoot = getCareerOpsRoot(), scanId, receiptPath, receipt, lockOptions, refreshStatus = refreshScanStatusSnapshot } = {}) {
   if (!scanId) throw new Error('Scan receipt requires the claimed scan ID');
   if (!receipt || receipt.run_id !== scanId || receipt.kind !== 'daily' || receipt.dry_run === true
     || receipt.scan_receipt?.version !== 'careerops.scan.receipt@1' || !Array.isArray(receipt.scan_receipt.added_urls)) {
     throw new Error('Scan receipt does not match the durable daily scan claim');
   }
-  return update(dataRoot, state => {
+  const result = await update(dataRoot, state => {
     if (!state?.scan_claim || state.scan_claim.scan_id !== scanId) throw new Error('Scan receipt does not match the durable scan claim');
     state.scan_claim.status = 'received';
     state.scan_claim.receipt_path = receiptPath || '';
@@ -105,13 +110,15 @@ export async function recordDailyScanReceipt({ dataRoot = getCareerOpsRoot(), sc
     state.next_action = 'plan_next_batch';
     return state;
   }, lockOptions);
+  return refreshStatusAfter(result, dataRoot, refreshStatus);
 }
-export async function markMissingScanReceipt({ dataRoot = getCareerOpsRoot(), scanId, lockOptions } = {}) {
-  return update(dataRoot, state => {
+export async function markMissingScanReceipt({ dataRoot = getCareerOpsRoot(), scanId, lockOptions, refreshStatus = refreshScanStatusSnapshot } = {}) {
+  const result = await update(dataRoot, state => {
     if (!state?.scan_claim || state.scan_claim.scan_id !== scanId) throw new Error('Missing receipt does not match the durable scan claim');
     state.scan_claim.status = 'missing_receipt'; state.status = 'partial'; state.stop_reason = 'claimed scan has no recoverable receipt';
     state.continue_required = true; state.next_action = 'recover_scan_receipt'; state.updated_at = new Date().toISOString(); return state;
   }, lockOptions);
+  return refreshStatusAfter(result, dataRoot, refreshStatus);
 }
 export function readRunStatus({ dataRoot = getCareerOpsRoot(), now = new Date(), staleMs = 60 * 60 * 1000 } = {}) {
   const state = read(dataRoot); if (!state) return { status: 'none', display_status: 'none', continue_required: false, next_action: 'start_run', counts: durableCounts(dataRoot, now) };
@@ -126,13 +133,14 @@ export function readRunStatus({ dataRoot = getCareerOpsRoot(), now = new Date(),
   }
   return { ...state, ...(batch ? { current_batch: batch } : {}), counts: durableCounts(dataRoot, now), display_status: stale ? 'stale-running' : state.status, next_action: stale ? 'resume_run' : state.next_action };
 }
-export async function markRunPartial({ dataRoot = getCareerOpsRoot(), reason, nextAction = 'resolve_unacknowledged_diagnosis', now = new Date(), lockOptions } = {}) {
-  return update(dataRoot, state => {
+export async function markRunPartial({ dataRoot = getCareerOpsRoot(), reason, nextAction = 'resolve_unacknowledged_diagnosis', now = new Date(), lockOptions, refreshStatus = refreshScanStatusSnapshot } = {}) {
+  const result = await update(dataRoot, state => {
     if (!state) throw new Error('No Sunny run');
     state.status = 'partial'; state.stop_reason = reason || 'durable work remains';
     state.continue_required = true; state.next_action = nextAction; state.updated_at = new Date(now).toISOString();
     return state;
   }, lockOptions);
+  return refreshStatusAfter(result, dataRoot, refreshStatus);
 }
 /** Controller-owned reconciliation entrypoint. Job receipt replay remains the
  * authoritative writer, so this wrapper never creates a competing mutation. */
@@ -291,8 +299,8 @@ function requiredOperations(batch, outcome, payload) {
   }
   return names;
 }
-export async function closeBatch({ dataRoot = getCareerOpsRoot(), batchId, closeout, now = new Date(), lockOptions } = {}) {
-  return update(dataRoot, state => {
+export async function closeBatch({ dataRoot = getCareerOpsRoot(), batchId, closeout, now = new Date(), lockOptions, refreshStatus = refreshScanStatusSnapshot } = {}) {
+  const result = await update(dataRoot, state => {
     const batch = state?.current_batch;
     if (!batch || batch.id !== batchId) {
       const prior = (state?.recent_batches || []).find(item => item.id === batchId);
@@ -332,8 +340,13 @@ export async function closeBatch({ dataRoot = getCareerOpsRoot(), batchId, close
     if (batch.type !== 'final_closeout') { state.continue_required = false; state.next_action = 'plan_next_batch'; }
     state.updated_at = new Date(now).toISOString(); return state;
   }, lockOptions);
+  return refreshStatusAfter(result, dataRoot, refreshStatus);
 }
-export async function stopRun({ dataRoot = getCareerOpsRoot(), status, reason = '', lockOptions } = {}) { if (!['partial', 'failed', 'complete'].includes(status)) throw new Error('Invalid terminal run status'); return update(dataRoot, state => { if (!state) throw new Error('No Sunny run'); const counts = durableCounts(dataRoot); if (status === 'complete' && state.current_batch) throw new Error('Cannot complete with an open batch'); if (status === 'complete' && (counts.normal || counts.due_retries || counts.diagnoses || counts.unresolved_diagnoses)) throw new Error('Cannot complete while durable pending work or unresolved diagnosis remains'); if (status === 'complete' && state.scan_claim && state.scan_claim.status !== 'received') throw new Error('Cannot complete with an unaccounted scan claim'); if (status === 'complete' && !state.final_closeout) throw new Error('Cannot complete before final closeout'); state.status = status; state.stop_reason = reason; state.counts = counts; state.continue_required = status !== 'complete' && Boolean(state.current_batch); state.next_action = status === 'complete' ? 'none' : 'resume_run'; state.updated_at = new Date().toISOString(); return state; }, lockOptions); }
+export async function stopRun({ dataRoot = getCareerOpsRoot(), status, reason = '', lockOptions, refreshStatus = refreshScanStatusSnapshot } = {}) {
+  if (!['partial', 'failed', 'complete'].includes(status)) throw new Error('Invalid terminal run status');
+  const result = await update(dataRoot, state => { if (!state) throw new Error('No Sunny run'); const counts = durableCounts(dataRoot); if (status === 'complete' && state.current_batch) throw new Error('Cannot complete with an open batch'); if (status === 'complete' && (counts.normal || counts.due_retries || counts.diagnoses || counts.unresolved_diagnoses)) throw new Error('Cannot complete while durable pending work or unresolved diagnosis remains'); if (status === 'complete' && state.scan_claim && state.scan_claim.status !== 'received') throw new Error('Cannot complete with an unaccounted scan claim'); if (status === 'complete' && !state.final_closeout) throw new Error('Cannot complete before final closeout'); state.status = status; state.stop_reason = reason; state.counts = counts; state.continue_required = status !== 'complete' && Boolean(state.current_batch); state.next_action = status === 'complete' ? 'none' : 'resume_run'; state.updated_at = new Date().toISOString(); return state; }, lockOptions);
+  return refreshStatusAfter(result, dataRoot, refreshStatus);
+}
 
 if (isMainModule(import.meta.url)) {
   const [command] = process.argv.slice(2); const index = process.argv.indexOf('--input');

@@ -101,7 +101,7 @@ function cachedContacts(previous, now) {
 function receiptTimes(receipts = []) {
   const map = new Map();
   for (const receipt of receipts) {
-    if (receipt?.dry_run || !receipt?.started_at || !Array.isArray(receipt?.scan_receipt?.added_urls)) continue;
+    if (receipt?.dry_run || !['daily', 'backfill'].includes(receipt?.kind) || !validTimestamp(receipt?.started_at) || !Array.isArray(receipt?.scan_receipt?.added_urls)) continue;
     for (const url of receipt.scan_receipt.added_urls) try {
       const key = canonicalUrl(url); const old = map.get(key);
       if (!old || new Date(receipt.started_at) < new Date(old)) map.set(key, receipt.started_at);
@@ -109,6 +109,7 @@ function receiptTimes(receipts = []) {
   }
   return map;
 }
+function validTimestamp(value) { return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value) && !Number.isNaN(new Date(value).getTime()); }
 function dayEnd(date, timeZone) {
   // Find the instant that formats as this zone's final local second. The
   // iterative offset adjustment keeps this correct across DST transitions.
@@ -138,9 +139,11 @@ export function buildSnapshot(archive, now = new Date(), referralState = null, r
     if (scanAt < cutoff) continue;
     const applyUrl = canonicalUrl(source.applyUrl);
     const key = `${source.scanDate}|${applyUrl}`;
-    const exact = source.scannedAt || receiptByUrl.get(applyUrl);
+    const explicit = validTimestamp(source.scannedAt) ? source.scannedAt : null;
+    const receipt = validTimestamp(receiptByUrl.get(applyUrl)) ? receiptByUrl.get(applyUrl) : null;
+    const exact = explicit || receipt;
     const job = { ...source, id: applyUrl, applyUrl, score: Number(source.score), referralContacts: [],
-      scannedAt: exact || dayEnd(source.scanDate, timeZone), scannedAtPrecision: source.scannedAt ? 'explicit' : exact ? 'receipt' : 'day-end-fallback' };
+      scannedAt: exact || dayEnd(source.scanDate, timeZone), scannedAtPrecision: explicit ? 'explicit' : receipt ? 'receipt' : 'day-end-fallback' };
     const current = deduped.get(key);
     if (!current || job.score > current.score) deduped.set(key, job);
   }
@@ -196,11 +199,15 @@ function main() {
   const archivePath = resolve(process.argv[2] || `${dataRoot}/data/sunny-job-search-archive.json`);
   const outputPath = resolve(process.argv[3] || `${checkoutRoot}/local/sunny-job-search/data/jobs.json`);
   const referralPath = resolve(process.argv[4] || `${dataRoot}/data/sunny-linkedin-referrals.json`);
-  if (!existsSync(archivePath)) throw new Error(`Sunny archive not found at ${archivePath}. Existing snapshot was preserved.`);
-  const snapshot = refreshSnapshot({ archivePath, referralPath, outputPath });
-  // Status has independent durable inputs; refresh it even when this command is
-  // later adapted to tolerate a jobs-snapshot failure.
+  let snapshot; let jobsError = null;
+  try {
+    if (!existsSync(archivePath)) throw new Error(`Sunny archive not found at ${archivePath}. Existing snapshot was preserved.`);
+    snapshot = refreshSnapshot({ archivePath, referralPath, outputPath });
+  } catch (error) { jobsError = error; }
+  // Status has independent durable inputs, so an archive/jobs failure must not
+  // suppress the status refresh at daily closeout.
   refreshScanStatusSnapshot({ dataRoot, outputPath: resolve(checkoutRoot, 'local/sunny-job-search/data/scan-status.json') });
+  if (jobsError) throw jobsError;
   console.log(`Sunny snapshot refreshed: ${snapshot.jobs.length} jobs (${snapshot.jobs.at(-1).scanDate} to ${snapshot.jobs[0].scanDate}).`);
 }
 
