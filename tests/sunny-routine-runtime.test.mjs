@@ -49,8 +49,11 @@ test('checkpoint validates mutable state and rotates to the newest seven archive
     'data/scan-runs.tsv', 'data/sunny-company-leads.tsv', 'data/sunny-company-resolution.tsv',
     'data/portal-health.tsv', 'data/company-discovery/coverage/progress.json',
     'data/cache/ats-board-owners.json', 'data/cache/openjobs-fleet-slugs.json',
+    'data/sunny-job-exception-queue.json', 'data/sunny-scan-exception-queue.json',
     'data/cache/ats-companies/example.json', 'data/company-discovery/receipts/daily-fixture.json',
-  ]) writeFileSync(join(dataRoot, relative), relative.endsWith('.json') ? '{}\n' : 'header\n');
+  ]) writeFileSync(join(dataRoot, relative), relative.endsWith('exception-queue.json')
+    ? '{"schema_version": 1, "items": []}\n'
+    : relative.endsWith('.json') ? '{}\n' : 'header\n');
   let latest;
   for (let i = 0; i < 8; i += 1) {
     latest = createSunnyCheckpoint({ dataRoot, now: new Date(Date.UTC(2026, 0, 1, 0, 0, i)) });
@@ -59,6 +62,9 @@ test('checkpoint validates mutable state and rotates to the newest seven archive
   const backupDir = join(dataRoot, '.sunny-state-backups');
   assert.equal(readdirSync(backupDir).filter(name => name.endsWith('.tgz')).length, 7);
   assert.equal(existsSync(join(backupDir, 'latest.json')), true);
+  assert.deepEqual(latest.files.filter(file => file.path.includes('exception-queue')).map(file => file.path), [
+    'data/sunny-job-exception-queue.json', 'data/sunny-scan-exception-queue.json',
+  ]);
 });
 
 test('daily scanner waits for the company routine lease instead of overlapping it', async t => {
@@ -86,8 +92,10 @@ test('company wrapper owns one lease, stops before deadline, and checkpoints par
   t.after(() => rmSync(dataRoot, { recursive: true, force: true }));
   mkdirSync(join(dataRoot, 'data/company-discovery/coverage'), { recursive: true });
   mkdirSync(join(dataRoot, 'data/cache/ats-companies'), { recursive: true });
-  for (const relative of ['portals.yml', 'data/sunny-job-queue.json', 'data/sunny-pipeline.md', 'data/sunny-scan-history.tsv', 'data/scan-runs.tsv', 'data/sunny-company-leads.tsv', 'data/sunny-company-resolution.tsv', 'data/portal-health.tsv', 'data/company-discovery/coverage/progress.json', 'data/cache/ats-board-owners.json', 'data/cache/openjobs-fleet-slugs.json', 'data/cache/ats-companies/example.json']) {
-    writeFileSync(join(dataRoot, relative), relative.endsWith('.json') ? '{"schema_version": 1, "jobs": []}\n' : 'header\n');
+  for (const relative of ['portals.yml', 'data/sunny-job-queue.json', 'data/sunny-pipeline.md', 'data/sunny-scan-history.tsv', 'data/scan-runs.tsv', 'data/sunny-company-leads.tsv', 'data/sunny-company-resolution.tsv', 'data/portal-health.tsv', 'data/company-discovery/coverage/progress.json', 'data/cache/ats-board-owners.json', 'data/cache/openjobs-fleet-slugs.json', 'data/sunny-job-exception-queue.json', 'data/sunny-scan-exception-queue.json', 'data/cache/ats-companies/example.json']) {
+    writeFileSync(join(dataRoot, relative), relative.endsWith('exception-queue.json')
+      ? '{"schema_version": 1, "items": []}\n'
+      : relative.endsWith('.json') ? '{"schema_version": 1, "jobs": []}\n' : 'header\n');
   }
   let current = Date.parse('2026-09-09T10:00:00Z');
   const calls = [];

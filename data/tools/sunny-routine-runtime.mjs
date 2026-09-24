@@ -17,6 +17,7 @@ const REQUIRED_STATE_PATHS = [
   'data/sunny-company-resolution.tsv', 'data/portal-health.tsv',
   'data/company-discovery/coverage/progress.json', 'data/cache/ats-board-owners.json',
   'data/cache/openjobs-fleet-slugs.json',
+  'data/sunny-job-exception-queue.json', 'data/sunny-scan-exception-queue.json',
 ];
 
 function sha256(path) {
