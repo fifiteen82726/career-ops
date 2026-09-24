@@ -13,6 +13,10 @@ function usable(receipt) { return receipt?.kind === 'daily' && receipt?.dry_run 
 const numeric = value => value != null && Number.isFinite(Number(value)) ? Number(value) : null;
 const validPrior = row => row && /^\d{4}-\d{2}-\d{2}$/.test(row.date) && ['green', 'yellow', 'red'].includes(row.status)
   && typeof row.label === 'string' && typeof row.summary === 'string' && Array.isArray(row.issues);
+const isSameReceiptAsPrior = (receipt, prior) => receipt?.receipt_path === prior?.receiptPath
+  && receipt?.started_at === prior?.startedAt;
+const isNewerReceiptThanPrior = (receipt, prior) => validInstant(receipt?.started_at) && validInstant(prior?.startedAt)
+  && new Date(receipt.started_at) > new Date(prior.startedAt);
 
 export function classifyScanDay(evidence = {}) {
   if (evidence.claimedMissing || evidence.identityMismatch || (evidence.failed && !evidence.usableReceipt) || (evidence.stopped && evidence.pendingKnown && evidence.pending > 0)) return 'red';
@@ -29,8 +33,11 @@ export function buildScanStatusSnapshot({ receipts = [], state = null, jobs, can
   const days = new Set([...priorDays.keys(), ...daily.keys()]);
   if (/^\d{4}-\d{2}-\d{2}$/.test(state?.ny_day || '')) days.add(state.ny_day);
   const rows = [...days].sort().map(date => {
-    const receipt = daily.get(date); const current = state?.ny_day === date ? state : null;
+    const receipt = daily.get(date); const current = state?.ny_day === date ? state : null; const priorRow = priorDays.get(date);
     if (!current && !receipt && priorDays.has(date)) return priorDays.get(date);
+    // A historical row contains completion evidence that the rollover controller no
+    // longer carries. Keep it until a later receipt provides fresh same-day evidence.
+    if (!current && priorRow && receipt && (isSameReceiptAsPrior(receipt, priorRow) || !isNewerReceiptThanPrior(receipt, priorRow))) return priorRow;
     if (!receipt && !current) return priorDays.get(date);
     const receiptMatchesClaim = !current?.scan_claim || !receipt || current.scan_claim.scan_id === receipt.run_id;
     const claimedMissing = Boolean(current?.scan_claim && !receipt);

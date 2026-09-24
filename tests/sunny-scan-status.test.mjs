@@ -53,6 +53,17 @@ test('a valid newer receipt replaces same-day history without inheriting histori
   assert.match(row.summary, /完成狀態未驗證/);
 });
 
+test('a retained completed historical receipt preserves its prior row after controller rollover', () => {
+  const receipt = { run_id: 'prior-run', kind: 'daily', dry_run: false, started_at: '2026-09-23T16:00:00.000Z', completion_status: 'complete', warnings: [], scan_receipt: { version: 'careerops.scan.receipt@1', added_urls: [], errors: [] }, receipt_path: 'data/company-discovery/receipts/daily-prior.json' };
+  const historical = { date: '2026-09-23', status: 'green', label: '完成', startedAt: receipt.started_at, finishedAt: '2026-09-23T17:00:00.000Z', scannedPortals: 10, found: 2, added: 1, published: 1, rejected: 0, normalPending: 0, candidateExceptions: 0, sourceExceptions: 0, sourceErrors: 0, warnings: 0, summary: '掃描完成，沒有待處理工作或例外。', issues: [], receiptPath: receipt.receipt_path };
+  const snapshot = buildScanStatusSnapshot({
+    prior: { schemaVersion: 1, days: [historical] }, receipts: [receipt],
+    state: { ny_day: '2026-09-24', status: 'complete', scan_claim: { scan_id: 'today-run', status: 'received' } },
+    jobs: [], candidateExceptions: [], sourceExceptions: [],
+  });
+  assert.deepEqual(snapshot.days.find(row => row.date === '2026-09-23'), historical);
+});
+
 test('malformed prior status documents and rows are ignored while valid receipts reconstruct rows', () => {
   const receipt = { run_id: 'rebuild', kind: 'daily', dry_run: false, started_at: '2026-09-22T16:00:00.000Z', completion_status: 'complete', warnings: [], scan_receipt: { version: 'careerops.scan.receipt@1', added_urls: [], errors: [] } };
   const snapshot = buildScanStatusSnapshot({ prior: { schemaVersion: 1, days: [{ date: 'not-a-date', status: 'green' }] }, receipts: [receipt], jobs: [], candidateExceptions: [], sourceExceptions: [] });
