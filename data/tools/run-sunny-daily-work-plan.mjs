@@ -111,7 +111,10 @@ export async function buildDailyWorkPlan({
       ...(existing.catch_up ? { receipt_provenance: existing.catch_up.receipt_provenance } : {}),
     };
   }
-  if (existing.final_closeout) {
+  const workAfterCloseout = existing.counts.normal_pending > 0
+    || existing.counts.due_retries > 0
+    || existing.counts.diagnoses_unacknowledged > 0;
+  if (existing.final_closeout && !workAfterCloseout) {
     return {
       phase: 'terminal', terminal: true, batch: null, normal_jobs: [], exception_jobs: [], diagnoses_due: [], scan: null,
       reconciliation: { terminal: true }, run_id: existing.run_id, run_status: existing.status,

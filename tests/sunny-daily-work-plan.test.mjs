@@ -177,6 +177,34 @@ test('a completed same-day run retains its scan ownership through a third invoca
   assert.equal(third.batch, null);
 });
 
+test('new pending work after same-day final closeout reopens the run without rescanning', async t => {
+  const dataRoot = root(t); let calls = 0;
+  const scan = async options => { calls += 1; return runSerializedScan({ ...options, routineLease: false, runChild: async () => ({
+    exitCode: 0, stdout: JSON.stringify({ version: 'careerops.scan.receipt@1', added_urls: [], errors: [] }), stderr: '',
+  }) }); };
+  const first = await buildDailyWorkPlan({ dataRoot, now: new Date('2026-09-24T16:00:00.000Z'), scan });
+  await closeBatch({ dataRoot, batchId: first.batch.id, closeout: {
+    date_tab: { status: 'not_applicable', reference: 'n/a' }, master: { status: 'not_applicable', reference: 'n/a' },
+    excluded: { status: 'not_applicable', reference: 'n/a' }, seen_jobs: { status: 'not_applicable', reference: 'n/a' },
+    scan_summary: { status: 'updated', reference: 'summary!A1' }, archive: { status: 'not_applicable', reference: 'n/a' },
+    index: { status: 'not_applicable', reference: 'n/a' }, queue_disposition: { status: 'not_applicable', reference: 'n/a' },
+  } });
+  const url = 'https://example.com/jobs/late-same-day';
+  await enqueueScanReceipt(receipt(url, 'daily-late-same-day'), { dataRoot });
+
+  const reopened = await buildDailyWorkPlan({
+    dataRoot,
+    runScan: false,
+    now: new Date('2026-09-24T19:00:00.000Z'),
+  });
+
+  assert.equal(calls, 1);
+  assert.equal(reopened.phase, 'normal');
+  assert.equal(reopened.batch.type, 'normal');
+  assert.deepEqual(reopened.normal_jobs.map(job => job.url), [url]);
+  assert.equal(JSON.parse(readFileSync(join(dataRoot, 'data/sunny-daily-run-state.json'))).final_closeout, undefined);
+});
+
 test('an acknowledged diagnosis remains a blocker but is never selected for another diagnosis batch', async t => {
   const dataRoot = root(t); const key = 'source|ack-blocker|transient';
   for (const failed_at of ['2026-09-20T00:00:00.000Z', '2026-09-21T00:00:00.000Z', '2026-09-22T00:00:00.000Z']) {

@@ -64,7 +64,13 @@ export async function startOrResumeRun({ dataRoot = getCareerOpsRoot(), now = ne
     const resumable = existing && (existing.current_batch || (existing.ny_day === day && ['running', 'partial', 'failed'].includes(existing.status)));
     const state = resumable ? existing : { schema_version: 1, run_id: `${mode}-${day}-${randomUUID()}`, ny_day: day, mode, status: 'running', phase: 'scan', started_at: at, processed: { published: 0, rejected: 0, duplicate: 0, closed: 0, deferred: 0 }, coverage: { status: 'unknown' }, current_batch: null, recent_batches: [], ...(catch_up ? { catch_up } : {}) };
     if (resumable) state.status = 'running';
-    if (!state.current_batch && batch && !(batch.type === 'final_closeout' && state.final_closeout)) { state.current_batch = batchFor(state.run_id, batch); state.phase = ['normal', 'candidate_retry'].includes(batch.type) ? 'normal' : 'exceptions'; }
+    if (!state.current_batch && batch && !(batch.type === 'final_closeout' && state.final_closeout)) {
+      // A scan receipt can enqueue more durable work after an earlier same-day
+      // closeout. Reopen the run before attaching that work so the stale
+      // closeout cannot make the planner report a false terminal state.
+      if (state.final_closeout && batch.type !== 'final_closeout') delete state.final_closeout;
+      state.current_batch = batchFor(state.run_id, batch); state.phase = ['normal', 'candidate_retry'].includes(batch.type) ? 'normal' : 'exceptions';
+    }
     state.updated_at = at; state.continue_required = Boolean(state.current_batch); state.next_action = state.current_batch ? 'checkpoint_batch' : 'plan_next_batch'; return state;
   }, lockOptions);
 }
