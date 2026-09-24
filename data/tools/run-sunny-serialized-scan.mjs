@@ -126,6 +126,7 @@ export async function runSerializedScan({
   dryRun = false,
   runChild = defaultRunChild,
   now = new Date(),
+  runId: suppliedRunId,
   lockOptions,
   routineLease = kind === 'daily',
 } = {}) {
@@ -145,7 +146,7 @@ export async function runSerializedScan({
     mkdirSync(paths.receipts, { recursive: true });
 
     const startedAt = new Date(now).toISOString();
-    const runId = `${kind}-${startedAt.replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`;
+    const runId = suppliedRunId || `${kind}-${startedAt.replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`;
     let portalsPath = paths.portals;
     let temporaryPortals = '';
     let exactCompany = '';

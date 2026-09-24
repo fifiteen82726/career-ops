@@ -30,6 +30,19 @@ function isoFileTime(now) {
 
 function checkpointFiles(dataRoot) {
   const files = REQUIRED_STATE_PATHS.filter(path => existsSync(join(dataRoot, path)));
+  const controller = join(dataRoot, 'data/sunny-daily-run-state.json');
+  if (existsSync(controller)) {
+    files.push('data/sunny-daily-run-state.json');
+    const state = JSON.parse(readFileSync(controller, 'utf8'));
+    const batches = [state.current_batch, ...(state.recent_batches || [])].filter(Boolean);
+    for (const batch of batches) {
+      if (!batch.payload_path || !existsSync(batch.payload_path)) continue;
+      const path = relative(dataRoot, resolve(batch.payload_path));
+      // A corrupt controller must not make backups copy arbitrary host files.
+      if (path.startsWith('..') || resolve(dataRoot, path) !== resolve(batch.payload_path)) throw new Error('checkpoint payload path escapes data root');
+      files.push(path);
+    }
+  }
   for (const root of ['data/company-discovery/receipts', 'data/cache/ats-companies']) {
     const absolute = join(dataRoot, root);
     if (!existsSync(absolute)) continue;

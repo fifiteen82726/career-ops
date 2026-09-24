@@ -4,8 +4,9 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { getCareerOpsRoot } from '../../path-resolver.mjs';
 import { acquirePipelineLock } from '../../pipeline-lock.mjs';
+import { isMainModule } from '../../lib/is-main-module.mjs';
 import { canonicalLeadUrl } from './sunny-company-leads.mjs';
-import { deferJobForException, releaseJobFromException } from './sunny-job-queue.mjs';
+import { deferJobForException, releaseJobFromException, markJobDisposition, terminalizeExceptionJob } from './sunny-job-queue.mjs';
 import { readExceptionQueue, recordFailure } from './sunny-exception-store.mjs';
 
 function candidateStorePath(dataRoot) {
@@ -42,7 +43,7 @@ async function withCandidateTransition(fn, { dataRoot, lockOptions } = {}) {
   }
 }
 
-async function markResolved(key, { dataRoot, lockOptions } = {}) {
+async function markResolved(key, evidence, { dataRoot, lockOptions } = {}) {
   const file = candidateStorePath(dataRoot);
   mkdirSync(join(dataRoot, 'data'), { recursive: true });
   const lock = await acquirePipelineLock(join(dataRoot, 'data/.sunny-exception-store'), lockOptions);
@@ -60,6 +61,7 @@ async function markResolved(key, { dataRoot, lockOptions } = {}) {
     item.status = 'resolved';
     item.next_retry_at = null;
     item.resolved_at = new Date().toISOString();
+    item.resolution_evidence = evidence ?? item.resolution_evidence ?? null;
     writeFileSync(temporary, `${JSON.stringify(doc, null, 2)}\n`, 'utf8');
     renameSync(temporary, file);
     return { ...item };
@@ -85,6 +87,9 @@ async function deferCandidateFailureUnlocked({
   message = '',
   evidence = null,
   failed_at,
+  attempt_id,
+  attempt_at,
+  terminalize_closed = false,
 } = {}, { dataRoot = getCareerOpsRoot(), now, lockOptions } = {}) {
   const canonicalUrl = canonicalLeadUrl(url);
   const key = candidateKey({ url: canonicalUrl, stage });
@@ -95,6 +100,8 @@ async function deferCandidateFailureUnlocked({
     stage: String(stage).trim(),
     message: String(message || ''),
     evidence,
+    ...(attempt_id ? { attempt_id } : {}),
+    ...(attempt_at ? { attempt_at } : {}),
     ...(failed_at ? { failed_at } : now ? { failed_at: now }
       : previous?.last_failed_at ? { failed_at: previous.last_failed_at } : {}),
   }, { dataRoot, queue: 'candidate', lockOptions });
@@ -105,6 +112,16 @@ async function deferCandidateFailureUnlocked({
       status: persistedJob(dataRoot, canonicalUrl)?.status || 'missing',
       replayed: true,
     } };
+  }
+
+  if (exception.status === 'closed' && terminalize_closed) {
+    const existing = persistedJob(dataRoot, canonicalUrl);
+    const job = existing?.status === 'closed'
+      ? { ...existing, replayed: true }
+      : existing?.status === 'exception' && existing.exception_key === key
+        ? await terminalizeExceptionJob({ url: canonicalUrl, exception_key: key, status: 'closed', reason: String(message || 'official posting expiry') }, { dataRoot, lockOptions })
+        : await markJobDisposition({ url: canonicalUrl, status: 'closed', reason: String(message || 'official posting expiry') }, { dataRoot, lockOptions });
+    return { key, exception, job };
   }
 
   let job;
@@ -126,7 +143,7 @@ export async function deferCandidateFailure(failure = {}, options = {}) {
 }
 
 /** Resolve an exception and only re-open stages that require a fresh review. */
-async function resolveCandidateExceptionUnlocked({ url, stage } = {}, {
+async function resolveCandidateExceptionUnlocked({ url, stage, terminal_status, evidence } = {}, {
   dataRoot = getCareerOpsRoot(),
   lockOptions,
 } = {}) {
@@ -135,10 +152,12 @@ async function resolveCandidateExceptionUnlocked({ url, stage } = {}, {
   const item = readExceptionQueue({ dataRoot, queue: 'candidate' }).find(candidate => candidate.key === key);
   if (!item) throw new Error('Candidate exception not found');
 
-  const released = needsNewNormalEvaluation(item)
+  const released = !terminal_status && needsNewNormalEvaluation(item)
     && alreadyDeferred(dataRoot, canonicalUrl, key);
-  if (released) await releaseJobFromException({ url: canonicalUrl, exception_key: key }, { dataRoot, lockOptions });
-  await markResolved(key, { dataRoot, lockOptions });
+  if (terminal_status) await terminalizeExceptionJob({ url: canonicalUrl, exception_key: key, status: terminal_status,
+    reason: terminal_status === 'closed' ? String(evidence?.official_expiry || evidence?.reason || 'official posting expiry') : '', sheet_ref: evidence?.sheet_ref || evidence?.master_reference || '' }, { dataRoot, lockOptions });
+  else if (released) await releaseJobFromException({ url: canonicalUrl, exception_key: key }, { dataRoot, lockOptions });
+  await markResolved(key, evidence, { dataRoot, lockOptions });
   return { key, status: 'resolved', released };
 }
 
@@ -148,4 +167,36 @@ export async function resolveCandidateException(exception = {}, options = {}) {
     () => resolveCandidateExceptionUnlocked(exception, { ...options, dataRoot }),
     { dataRoot, lockOptions: options.lockOptions },
   );
+}
+
+/** Typed CLI outcome: replay-safe failures keep their supplied attempt timestamp;
+ * recovery releases only JD/normal work, while verified terminal repairs resolve. */
+export async function applyCandidateOutcome(input = {}, options = {}) {
+  const dataRoot = options.dataRoot || input.dataRoot || getCareerOpsRoot();
+  if (!input.url || !input.stage) throw new Error('Candidate outcome requires url and stage');
+  if (input.outcome === 'failure') return deferCandidateFailure({
+    url: input.url, stage: input.stage, message: input.message, evidence: input.evidence,
+    attempt_id: input.attempt_id,
+    attempt_at: input.attempt_at || input.failed_at,
+    terminalize_closed: true,
+  }, { ...options, dataRoot });
+  if (input.outcome === 'resolve') {
+    if (['publish', 'archive', 'index'].includes(input.stage)
+      && (!input.evidence?.date_tab_reference || !input.evidence?.master_reference)) {
+      throw new Error('Publication repair requires verified date-tab and Master references');
+    }
+    const terminal_status = ['publish', 'archive', 'index'].includes(input.stage) ? 'published' : undefined;
+    return resolveCandidateException({ url: input.url, stage: input.stage, terminal_status, evidence: input.evidence }, { ...options, dataRoot });
+  }
+  throw new Error('Candidate outcome must be failure or resolve');
+}
+
+if (isMainModule(import.meta.url)) {
+  const [command] = process.argv.slice(2);
+  const inputPath = process.argv[process.argv.indexOf('--input') + 1];
+  Promise.resolve().then(async () => {
+    if (!['failure', 'resolve'].includes(command) || !inputPath) throw new Error('Use failure|resolve --input FILE');
+    const input = JSON.parse(readFileSync(inputPath, 'utf8'));
+    return applyCandidateOutcome({ ...input, outcome: command });
+  }).then(value => process.stdout.write(`${JSON.stringify(value)}\n`)).catch(error => { console.error(error.message); process.exitCode = 1; });
 }

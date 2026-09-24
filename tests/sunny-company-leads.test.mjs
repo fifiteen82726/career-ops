@@ -11,6 +11,11 @@ import {
   normalizeLead,
 } from '../data/tools/sunny-company-leads.mjs';
 
+test('canonicalLeadUrl serializes percent escapes with uppercase hex without decoding separators', () => {
+  assert.equal(canonicalLeadUrl('https://example.com/jobs/a%7cb'), 'https://example.com/jobs/a%7Cb');
+  assert.equal(canonicalLeadUrl('https://example.com/jobs/a%7Cb'), 'https://example.com/jobs/a%7Cb');
+});
+
 test('relative or invalid dates retain raw provenance without verified publication', () => {
   for (const date of ['28 minutes ago', '2026-02-31']) {
     const row = normalizeLead({ company: 'Example', title: 'Data Analyst', posted_at: date },

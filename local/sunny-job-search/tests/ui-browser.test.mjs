@@ -21,8 +21,8 @@ test('browser referral filter, synchronized Connections search, message editing,
   try {
     const headers = await new Promise((resolve, reject) => httpRequest({ host: '127.0.0.1', port, path: '/' }, response => { const headers = response.headers; response.resume(); response.on('end', () => resolve(headers)); }).on('error', reject).end());
     assert.equal(headers['referrer-policy'], 'no-referrer'); assert.equal(headers['cache-control'], 'no-store');
-    browser = await chromium.launch({ headless: true }); const context = await browser.newContext({ permissions: ['clipboard-read', 'clipboard-write'] }); const page = await context.newPage(); await page.goto(`http://127.0.0.1:${port}/`);
-    assert.equal(await page.locator('tbody tr').count(), 3); await page.locator('#referrals-only').check(); assert.equal(await page.locator('tbody tr').count(), 2);
+    browser = await chromium.launch({ headless: true }); const context = await browser.newContext({ permissions: ['clipboard-read', 'clipboard-write'] }); const page = await context.newPage(); await page.clock.setFixedTime(new Date('2026-09-16T16:00:00.000Z')); await page.goto(`http://127.0.0.1:${port}/`);
+    await page.locator('tbody tr').first().waitFor(); assert.equal(await page.locator('tbody tr').count(), 3); await page.locator('#referrals-only').check(); assert.equal(await page.locator('tbody tr').count(), 2);
     const link = page.locator('.referral-contact a').first(); assert.equal(await link.getAttribute('href'), 'https://www.linkedin.com/in/example/'); assert.equal(await link.getAttribute('referrerpolicy'), 'no-referrer');
     await page.getByRole('button', { name: '複製姓名' }).first().click(); assert.equal(await page.evaluate(() => navigator.clipboard.readText()), 'Example Person'); await page.getByRole('button', { name: '複製連結' }).first().click(); assert.equal(await page.evaluate(() => navigator.clipboard.readText()), 'https://www.linkedin.com/in/example/');
 

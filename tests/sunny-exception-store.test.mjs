@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -11,6 +11,7 @@ import {
   readDueExceptions,
   readExceptionQueue,
   recordFailure,
+  reconcileExceptionIdentities,
 } from '../data/tools/sunny-exception-store.mjs';
 
 function root(t) {
@@ -135,4 +136,70 @@ test('concurrent failures for distinct keys persist each item exactly once', asy
   assert.deepEqual(stored.schema_version, 1);
   assert.deepEqual(stored.items.map(item => item.key).sort(), ['source|Alpha|transient', 'source|Beta|transient']);
   assert.deepEqual(stored.items.map(item => item.attempt_count).sort(), [1, 1]);
+});
+
+test('uses attempt_id for replay identity while retaining a distinct attempt_at timestamp', async t => {
+  const dataRoot = root(t);
+  const key = 'candidate|jd|https://example.com/attempt';
+  await recordFailure({ key, stage: 'jd', message: 'HTTP 503', attempt_id: 'attempt-1', attempt_at: '2026-09-01T00:00:00.000Z' }, { dataRoot, queue: 'candidate' });
+  await recordFailure({ key, stage: 'jd', message: 'HTTP 503', attempt_id: 'attempt-1', attempt_at: '2026-09-02T00:00:00.000Z' }, { dataRoot, queue: 'candidate' });
+  const item = readExceptionQueue({ dataRoot, queue: 'candidate' })[0];
+  assert.equal(item.attempt_count, 1);
+  assert.deepEqual(item.attempt_ids, ['attempt-1']);
+  assert.equal(item.attempt_at, '2026-09-01T00:00:00.000Z');
+});
+
+test('reconciles copied candidate identities and repairs linked job exception keys', async t => {
+  const dataRoot = root(t);
+  const upper = 'candidate|jd|https://example.com/jobs/a%7C14';
+  const lower = 'candidate|jd|https://example.com/jobs/a%7c14';
+  writeFileSync(join(dataRoot, 'data/sunny-job-exception-queue.json'), JSON.stringify({ schema_version: 1, items: [
+    { key: upper, stage: 'jd', status: 'retryable', first_failed_at: '2026-09-01T00:00:00.000Z', last_failed_at: '2026-09-01T00:00:00.000Z', failure_timestamps: ['2026-09-01T00:00:00.000Z'], attempt_ids: ['one'], attempt_count: 1, next_retry_at: '2026-09-02T00:00:00.000Z' },
+    { key: lower, stage: 'jd', status: 'retryable', first_failed_at: '2026-09-02T00:00:00.000Z', last_failed_at: '2026-09-02T00:00:00.000Z', failure_timestamps: ['2026-09-02T00:00:00.000Z'], attempt_ids: ['two'], attempt_count: 1, next_retry_at: '2026-09-04T00:00:00.000Z' },
+  ] }));
+  writeFileSync(join(dataRoot, 'data/sunny-job-queue.json'), JSON.stringify({ schema_version: 1, jobs: [{ url: 'https://example.com/jobs/a%7c14', status: 'exception', exception_key: lower }] }));
+  const result = await reconcileExceptionIdentities({ dataRoot });
+  assert.equal(result.candidate_merged, 1);
+  const items = readExceptionQueue({ dataRoot, queue: 'candidate' });
+  assert.equal(items.length, 1);
+  assert.equal(items[0].key, upper);
+  assert.equal(items[0].attempt_count, 2);
+  assert.equal(JSON.parse(readFileSync(join(dataRoot, 'data/sunny-job-queue.json'))).jobs[0].exception_key, upper);
+});
+
+test('candidate reconciliation converges pending and exception rows regardless of row order', async t => {
+  const dataRoot = root(t);
+  const upper = 'candidate|jd|https://example.com/jobs/a%7C14';
+  const lower = 'candidate|jd|https://example.com/jobs/a%7c14';
+  writeFileSync(join(dataRoot, 'data/sunny-job-exception-queue.json'), JSON.stringify({ schema_version: 1, items: [
+    { key: upper, stage: 'jd', status: 'retryable', first_failed_at: '2026-09-01T00:00:00.000Z', last_failed_at: '2026-09-01T00:00:00.000Z', attempt_ids: ['one'], attempt_count: 1 },
+    { key: lower, stage: 'jd', status: 'retryable', first_failed_at: '2026-09-02T00:00:00.000Z', last_failed_at: '2026-09-02T00:00:00.000Z', attempt_ids: ['two'], attempt_count: 1 },
+  ] }));
+  for (const jobs of [
+    [{ url: 'https://example.com/jobs/a%7C14', status: 'pending' }, { url: 'https://example.com/jobs/a%7c14', status: 'exception', exception_key: lower }],
+    [{ url: 'https://example.com/jobs/a%7c14', status: 'exception', exception_key: lower }, { url: 'https://example.com/jobs/a%7C14', status: 'pending' }],
+  ]) {
+    writeFileSync(join(dataRoot, 'data/sunny-job-queue.json'), JSON.stringify({ schema_version: 1, jobs }));
+    await reconcileExceptionIdentities({ dataRoot });
+    const job = JSON.parse(readFileSync(join(dataRoot, 'data/sunny-job-queue.json'), 'utf8')).jobs[0];
+    assert.equal(job.status, 'exception');
+    assert.equal(job.exception_key, upper);
+  }
+});
+
+test('repairs every malformed legacy coverage key by stripping warning prose', async t => {
+  const dataRoot = root(t);
+  const names = ['advancedmicrodevicesinc', 'costcowholesalecorporation', 'keysighttechnologiesinc', 'heb', 'medpace', 'novanthealth', 'paychex', 'sproutsfarmersmarket'];
+  writeFileSync(join(dataRoot, 'data/sunny-scan-exception-queue.json'), JSON.stringify({ schema_version: 1, items: names.map((name, i) => ({ key: `source|${name}hasmorepostingsthan|coverage`, stage: 'scan', status: 'retryable', first_failed_at: `2026-09-${String(i + 1).padStart(2, '0')}T00:00:00.000Z`, last_failed_at: `2026-09-${String(i + 1).padStart(2, '0')}T00:00:00.000Z`, attempt_count: 1, next_retry_at: '2026-10-01T00:00:00.000Z' })) }));
+  await reconcileExceptionIdentities({ dataRoot });
+  assert.deepEqual(readExceptionQueue({ dataRoot, queue: 'source' }).map(item => item.key).sort(), names.map(name => `source|${name}|coverage`).sort());
+});
+
+test('source identity migration derives every malformed coverage key from stored warning evidence', async t => {
+  const dataRoot = root(t);
+  writeFileSync(join(dataRoot, 'data/sunny-scan-exception-queue.json'), JSON.stringify({ schema_version: 1, items: [
+    { key: 'source|wronghasmorepostingsthan|coverage', stage: 'scan', status: 'retryable', first_failed_at: '2026-09-01T00:00:00.000Z', last_failed_at: '2026-09-01T00:00:00.000Z', attempt_count: 1, evidence: { detail: 'Jibe: Costco Wholesale Corporation has more postings than max_pages' } },
+  ] }));
+  await reconcileExceptionIdentities({ dataRoot });
+  assert.equal(readExceptionQueue({ dataRoot, queue: 'source' })[0].key, 'source|costcowholesalecorporation|coverage');
 });

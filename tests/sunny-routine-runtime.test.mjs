@@ -67,6 +67,22 @@ test('checkpoint validates mutable state and rotates to the newest seven archive
   ]);
 });
 
+test('checkpoint includes controller state and every referenced batch payload artifact', async t => {
+  const dataRoot = mkdtempSync(join(tmpdir(), 'sunny-routine-payload-backup-'));
+  t.after(() => rmSync(dataRoot, { recursive: true, force: true }));
+  mkdirSync(join(dataRoot, 'data/company-discovery/coverage'), { recursive: true });
+  for (const relative of ['portals.yml', 'data/sunny-job-queue.json', 'data/sunny-pipeline.md', 'data/sunny-scan-history.tsv', 'data/scan-runs.tsv', 'data/sunny-company-leads.tsv', 'data/sunny-company-resolution.tsv', 'data/portal-health.tsv', 'data/company-discovery/coverage/progress.json', 'data/cache/ats-board-owners.json', 'data/cache/openjobs-fleet-slugs.json', 'data/sunny-job-exception-queue.json', 'data/sunny-scan-exception-queue.json']) {
+    mkdirSync(join(dataRoot, relative, '..'), { recursive: true });
+    writeFileSync(join(dataRoot, relative), relative.endsWith('exception-queue.json') ? '{"schema_version":1,"items":[]}' : relative.endsWith('.json') ? '{}' : 'header\n');
+  }
+  const artifact = join(dataRoot, 'data/sunny-daily-payload-test.json');
+  writeFileSync(artifact, '{"schema_version":2,"payloads":{}}\n');
+  writeFileSync(join(dataRoot, 'data/sunny-daily-run-state.json'), JSON.stringify({ schema_version: 1, current_batch: { id: 'batch', payload_path: artifact }, recent_batches: [{ id: 'old', payload_path: artifact }] }));
+  const checkpoint = createSunnyCheckpoint({ dataRoot });
+  assert.ok(checkpoint.files.some(file => file.path === 'data/sunny-daily-run-state.json'));
+  assert.ok(checkpoint.files.some(file => file.path === 'data/sunny-daily-payload-test.json'));
+});
+
 test('daily scanner waits for the company routine lease instead of overlapping it', async t => {
   const dataRoot = mkdtempSync(join(tmpdir(), 'sunny-daily-lease-'));
   t.after(() => rmSync(dataRoot, { recursive: true, force: true }));

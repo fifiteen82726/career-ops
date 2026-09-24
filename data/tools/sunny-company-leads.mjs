@@ -80,7 +80,9 @@ export function canonicalLeadUrl(value) {
     if (TRACKING_PARAMS.has(key.toLowerCase())) url.searchParams.delete(key);
   }
 
-  return url.toString();
+  // URL serialisation intentionally keeps encoded separators encoded.  Normalize
+  // only the hex spelling so old %7c receipts share the %7C identity.
+  return url.toString().replace(/%[0-9a-fA-F]{2}/g, escape => escape.toUpperCase());
 }
 
 function normalizePostedAt(value) {

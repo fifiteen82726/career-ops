@@ -223,3 +223,13 @@ test('string coverage warnings retain separate Workday board identities', async 
     'source|betabank|coverage',
   ]);
 });
+
+test('uses a caller-persisted scan id in the receipt', async t => {
+  const dataRoot = mkdtempSync(join(tmpdir(), 'sunny-claimed-scan-'));
+  t.after(() => rmSync(dataRoot, { recursive: true, force: true }));
+  mkdirSync(join(dataRoot, 'data'), { recursive: true });
+  const result = await runSerializedScan({ kind: 'daily', dataRoot, routineLease: false, runId: 'claimed-scan-id', runChild: async () => ({
+    exitCode: 0, stdout: JSON.stringify({ ...validReceipt, added_urls: [], errors: [] }), stderr: '',
+  }) });
+  assert.equal(result.run_id, 'claimed-scan-id');
+});

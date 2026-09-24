@@ -55,6 +55,53 @@ export function readPendingJobs({ dataRoot = getCareerOpsRoot(), limit = Infinit
     .slice(0, limit);
 }
 
+function terminalStatus(job) {
+  return ['published', 'rejected', 'duplicate', 'closed'].includes(job.status) ? job.status : '';
+}
+
+function mergeJobs(left, right) {
+  const leftTerminal = terminalStatus(left);
+  const rightTerminal = terminalStatus(right);
+  if (leftTerminal && rightTerminal && leftTerminal !== rightTerminal) {
+    throw new Error(`Conflicting terminal dispositions for ${left.url}`);
+  }
+  const winner = { ...left };
+  for (const field of ['title', 'company', 'location', 'posted_at', 'first_seen', 'reason', 'sheet_ref', 'disposition_at', 'exception_key', 'exception_at']) {
+    if (!winner[field] && right[field]) winner[field] = right[field];
+  }
+  if (rightTerminal) winner.status = rightTerminal;
+  // An active exception is a durable claim that this candidate must stay out
+  // of normal evaluation.  It wins over a copied pending row in either order.
+  if (!leftTerminal && !rightTerminal && (left.status === 'exception' || right.status === 'exception')) {
+    winner.status = 'exception';
+    if (right.status === 'exception' && right.exception_key) winner.exception_key = right.exception_key;
+  }
+  const sources = [...(Array.isArray(left.sources) ? left.sources : []), ...(Array.isArray(right.sources) ? right.sources : [])];
+  winner.sources = [...new Map(sources.map(source => [JSON.stringify(source), source])).values()];
+  return winner;
+}
+
+export function normalizeJobQueueDocument(doc) {
+  const byUrl = new Map();
+  let merged = 0;
+  for (const legacy of doc.jobs) {
+    const url = canonicalLeadUrl(legacy.url);
+    const incoming = { ...legacy, url };
+    if (!byUrl.has(url)) byUrl.set(url, incoming);
+    else { byUrl.set(url, mergeJobs(byUrl.get(url), incoming)); merged += 1; }
+  }
+  doc.jobs = [...byUrl.values()];
+  return merged;
+}
+
+/** Rebuild canonical URL identities before replaying receipts. */
+export async function reconcileJobQueue({ dataRoot = getCareerOpsRoot(), ...options } = {}) {
+  return updateQueue(doc => {
+    const merged = normalizeJobQueueDocument(doc);
+    return { merged, jobs: doc.jobs.length };
+  }, { dataRoot, ...options });
+}
+
 export async function enqueueScanReceipt(receipt, { dataRoot = getCareerOpsRoot(), ...options } = {}) {
   if (receipt.dry_run || receipt.scan_receipt?.dry_run) return { added: 0, dry_run: true };
   if (!['daily', 'backfill'].includes(receipt.kind) || !receipt.run_id
@@ -75,6 +122,10 @@ export async function enqueueScanReceipt(receipt, { dataRoot = getCareerOpsRoot(
     return canonicalLeadUrl(raw);
   }))];
   return updateQueue(doc => {
+    // Receipt replay is a write boundary too: legacy identities must be
+    // reconciled before lookup, otherwise a published lowercase-escape row can
+    // be reintroduced as a second pending candidate.
+    normalizeJobQueueDocument(doc);
     const byUrl = new Map(doc.jobs.map(job => [job.url, job]));
     let added = 0;
     for (const url of urls) {
@@ -146,7 +197,24 @@ export async function releaseJobFromException({ url, exception_key }, options = 
   }, options);
 }
 
+/** Canonical candidate adapter transition: only the exception currently linked
+ * to the job may convert it to a terminal outcome. */
+export async function terminalizeExceptionJob({ url, exception_key, status, reason = '', sheet_ref = '' }, options = {}) {
+  if (!['published', 'closed'].includes(status)) throw new Error('Exception terminal outcome must be published or closed');
+  if (status === 'published' && !/^https:\/\/docs\.google\.com\/spreadsheets\/d\/[^/]+\/.*(?:range=|!)/.test(sheet_ref)) throw new Error('Published terminal outcome requires verified Sheet reference');
+  if (status === 'closed' && !String(reason).trim()) throw new Error('Closed terminal outcome requires official evidence');
+  return updateQueue(doc => {
+    const job = doc.jobs.find(item => item.url === canonicalLeadUrl(url));
+    if (!job) throw new Error('Job not found in exception queue');
+    if (job.status === status) return { url: job.url, status, replayed: true };
+    if (job.status !== 'exception' || job.exception_key !== exception_key) throw new Error('Terminal outcome requires matching linked exception');
+    Object.assign(job, { status, reason, sheet_ref, exception_key: '', disposition_at: new Date().toISOString() });
+    return { url: job.url, status };
+  }, options);
+}
+
 export async function reconcileScanReceipts({ dataRoot = getCareerOpsRoot() } = {}) {
+  const identity = await reconcileJobQueue({ dataRoot });
   const dir = join(dataRoot, 'data/company-discovery/receipts');
   const result = { receipts: 0, added: 0, errors: [] };
   for (const name of existsSync(dir) ? readdirSync(dir).filter(name => /^(daily|backfill)-.*\.json$/.test(name)).sort() : []) {
@@ -157,7 +225,7 @@ export async function reconcileScanReceipts({ dataRoot = getCareerOpsRoot() } = 
       result.added += ingested.added;
     } catch (error) { result.errors.push({ file: name, error: error.message }); }
   }
-  return { ...result, pending: readPendingJobs({ dataRoot }).length };
+  return { ...result, identity, pending: readPendingJobs({ dataRoot }).length };
 }
 
 if (isMainModule(import.meta.url)) {

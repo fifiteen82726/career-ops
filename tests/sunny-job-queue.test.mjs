@@ -40,6 +40,33 @@ test('morning backfill survives zero-result noon scan and receipt replay', async
   assert.equal(pending[0].sources[0].kind, 'backfill');
 });
 
+test('reconciles legacy percent-escape duplicate queue rows without losing sources', async t => {
+  const dataRoot = root(t);
+  writeFileSync(join(dataRoot, 'data/sunny-job-queue.json'), JSON.stringify({ schema_version: 1, jobs: [
+    { url: 'https://example.com/jobs/a%7cb', status: 'pending', sources: [{ run_id: 'old' }], first_seen: '2026-09-01' },
+    { url: 'https://example.com/jobs/a%7Cb', status: 'pending', sources: [{ run_id: 'new' }], first_seen: '2026-09-02', title: 'Title' },
+  ] }));
+  const result = await queue.reconcileJobQueue({ dataRoot });
+  assert.equal(result.merged, 1);
+  const stored = JSON.parse(readFileSync(join(dataRoot, 'data/sunny-job-queue.json'), 'utf8'));
+  assert.equal(stored.jobs.length, 1);
+  assert.equal(stored.jobs[0].url, 'https://example.com/jobs/a%7Cb');
+  assert.deepEqual(stored.jobs[0].sources.map(source => source.run_id).sort(), ['new', 'old']);
+});
+
+test('receipt replay normalizes a legacy published URL before matching it', async t => {
+  const dataRoot = root(t);
+  writeFileSync(join(dataRoot, 'data/sunny-job-queue.json'), JSON.stringify({ schema_version: 1, jobs: [{
+    url: 'https://example.com/jobs/a%7cb', status: 'published', sources: [],
+    sheet_ref: 'https://docs.google.com/spreadsheets/d/example/edit#gid=1&range=A2:N2',
+  }] }));
+  await queue.enqueueScanReceipt({ ...receipt, scan_receipt: { ...receipt.scan_receipt, added_urls: ['https://example.com/jobs/a%7Cb'] } }, { dataRoot });
+  const jobs = JSON.parse(readFileSync(join(dataRoot, 'data/sunny-job-queue.json'), 'utf8')).jobs;
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].status, 'published');
+  assert.equal(jobs[0].url, 'https://example.com/jobs/a%7Cb');
+});
+
 test('disposition needs evidence and replay never reopens processed work', async t => {
   const dataRoot = root(t);
   await queue.enqueueScanReceipt(receipt, { dataRoot });
@@ -357,4 +384,33 @@ test('a resolve and a newer candidate failure cannot leave normal and exception 
   assert.equal(item.attempt_count, 2);
   assert.equal(job.status, 'exception');
   assert.equal(job.exception_key, item.key);
+});
+
+test('verified publication and official expiry terminalize the linked exception job', async t => {
+  const dataRoot = root(t);
+  const url = 'https://example.com/terminal-outcome';
+  await queue.enqueueScanReceipt({ ...receipt, scan_receipt: { ...receipt.scan_receipt, added_urls: [url] } }, { dataRoot });
+  const { applyCandidateOutcome } = await import('../data/tools/sunny-job-exception-queue.mjs');
+  await applyCandidateOutcome({ outcome: 'failure', url, stage: 'publish', attempt_id: 'publish-1', attempt_at: '2026-09-01T00:00:00.000Z', message: 'Sheet write failed' }, { dataRoot });
+  await applyCandidateOutcome({ outcome: 'resolve', url, stage: 'publish', evidence: { date_tab_reference: 'tab!A1', master_reference: 'master!A1', sheet_ref: 'https://docs.google.com/spreadsheets/d/id/edit#gid=1&range=A1' } }, { dataRoot });
+  assert.equal(JSON.parse(readFileSync(join(dataRoot, 'data/sunny-job-queue.json'))).jobs[0].status, 'published');
+  const closedUrl = 'https://example.com/closed-outcome';
+  await queue.enqueueScanReceipt({ ...receipt, run_id: 'backfill-2', scan_receipt: { ...receipt.scan_receipt, added_urls: [closedUrl] } }, { dataRoot });
+  await applyCandidateOutcome({ outcome: 'failure', url: closedUrl, stage: 'jd', attempt_id: 'closed-1', attempt_at: '2026-09-01T00:00:00.000Z', message: 'official HTTP 404 job no longer available' }, { dataRoot });
+  assert.equal(JSON.parse(readFileSync(join(dataRoot, 'data/sunny-job-queue.json'))).jobs.find(job => job.url === closedUrl).status, 'closed');
+});
+
+test('a later official expiry closes an already-linked candidate exception and preserves resolution evidence', async t => {
+  const dataRoot = root(t);
+  const { applyCandidateOutcome } = await import('../data/tools/sunny-job-exception-queue.mjs');
+  await queue.enqueueScanReceipt(receipt, { dataRoot });
+  const key = `candidate|jd|${url}`;
+  await applyCandidateOutcome({ outcome: 'failure', url, stage: 'jd', attempt_id: 'first', attempt_at: '2026-09-01T00:00:00.000Z', message: 'HTTP 503' }, { dataRoot });
+  await applyCandidateOutcome({ outcome: 'failure', url, stage: 'jd', attempt_id: 'expired', attempt_at: '2026-09-02T00:00:00.000Z', message: 'official HTTP 404 job no longer available' }, { dataRoot });
+  const job = JSON.parse(readFileSync(join(dataRoot, 'data/sunny-job-queue.json'), 'utf8')).jobs[0];
+  assert.equal(job.status, 'closed');
+  const item = readExceptionQueue({ dataRoot, queue: 'candidate' }).find(value => value.key === key);
+  assert.equal(item.status, 'closed');
+  await resolveCandidateException({ url, stage: 'jd', evidence: { recovered_jd_reference: 'local/jds/example.md' } }, { dataRoot });
+  assert.deepEqual(readExceptionQueue({ dataRoot, queue: 'candidate' }).find(value => value.key === key).resolution_evidence, { recovered_jd_reference: 'local/jds/example.md' });
 });
