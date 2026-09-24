@@ -46,7 +46,13 @@ function historyIndex(dataRoot) {
 }
 
 export function readPendingJobs({ dataRoot = getCareerOpsRoot(), limit = Infinity } = {}) {
-  return readQueue(dataRoot).jobs.filter(job => job.status === 'pending').slice(0, limit);
+  return readQueue(dataRoot).jobs
+    .filter(job => job.status === 'pending')
+    .sort((left, right) => {
+      const byFirstSeen = String(right.first_seen || '').localeCompare(String(left.first_seen || ''));
+      return byFirstSeen || String(left.url || '').localeCompare(String(right.url || ''));
+    })
+    .slice(0, limit);
 }
 
 export async function enqueueScanReceipt(receipt, { dataRoot = getCareerOpsRoot(), ...options } = {}) {
@@ -100,6 +106,43 @@ export async function markJobDisposition({ url, status, reason, sheet_ref }, opt
     if (job.status !== 'pending' && job.status !== status) throw new Error('Cannot overwrite a terminal disposition');
     Object.assign(job, { status, reason: reason || '', sheet_ref: sheet_ref || '', disposition_at: new Date().toISOString() });
     return { url: job.url, status };
+  }, options);
+}
+
+export async function deferJobForException({ url, exception_key }, options = {}) {
+  if (exception_key === undefined || exception_key === null) throw new Error('Exception deferral requires a key');
+  const key = String(exception_key);
+  if (!key.trim()) throw new Error('Exception deferral requires a key');
+  return updateQueue(doc => {
+    const job = doc.jobs.find(item => item.url === canonicalLeadUrl(url));
+    if (!job) throw new Error('Job not found in pending queue');
+    if (['published', 'rejected', 'duplicate', 'closed'].includes(job.status)) {
+      throw new Error('Cannot defer a terminal disposition');
+    }
+    if (job.status !== 'pending') throw new Error('Job not found in pending queue');
+    Object.assign(job, {
+      status: 'exception',
+      exception_key: key,
+      exception_at: new Date().toISOString(),
+    });
+    return { url: job.url, status: job.status, exception_key: job.exception_key };
+  }, options);
+}
+
+export async function releaseJobFromException({ url, exception_key }, options = {}) {
+  if (exception_key === undefined || exception_key === null) throw new Error('Exception release requires the matching exception key');
+  const key = String(exception_key);
+  if (!key.trim()) throw new Error('Exception release requires the matching exception key');
+  return updateQueue(doc => {
+    const job = doc.jobs.find(item => item.url === canonicalLeadUrl(url));
+    if (!job || job.status !== 'exception') throw new Error('Job not found in exception queue');
+    if (job.exception_key !== key) throw new Error('Exception release requires the matching exception key');
+    Object.assign(job, {
+      status: 'pending',
+      exception_key: '',
+      exception_released_at: new Date().toISOString(),
+    });
+    return { url: job.url, status: job.status, exception_key: job.exception_key };
   }, options);
 }
 
