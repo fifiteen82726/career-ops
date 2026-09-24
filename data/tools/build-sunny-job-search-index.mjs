@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname, resolve, join } from 'node:path';
 import { getCareerOpsRoot } from '../../path-resolver.mjs';
 import { loadAndMigrateReferralState, migrateReferralState, validateReferralState } from '../../local/sunny-job-search/referrals.mjs';
+import { refreshScanStatusSnapshot } from './build-sunny-scan-status.mjs';
 
 const DAY_MS = 86_400_000;
 const REQUIRED_FIELDS = ['scanDate', 'priority', 'priorityLabel', 'score', 'recommendation', 'company', 'title', 'category', 'location', 'workMode', 'primaryGap', 'resume', 'applyUrl', 'referralMessage'];
@@ -97,7 +98,31 @@ function cachedContacts(previous, now) {
   return result;
 }
 
-export function buildSnapshot(archive, now = new Date(), referralState = null) {
+function receiptTimes(receipts = []) {
+  const map = new Map();
+  for (const receipt of receipts) {
+    if (receipt?.dry_run || !receipt?.started_at || !Array.isArray(receipt?.scan_receipt?.added_urls)) continue;
+    for (const url of receipt.scan_receipt.added_urls) try {
+      const key = canonicalUrl(url); const old = map.get(key);
+      if (!old || new Date(receipt.started_at) < new Date(old)) map.set(key, receipt.started_at);
+    } catch { /* malformed receipt URL is not timestamp evidence */ }
+  }
+  return map;
+}
+function dayEnd(date, timeZone) {
+  // Find the instant that formats as this zone's final local second. The
+  // iterative offset adjustment keeps this correct across DST transitions.
+  let guess = new Date(`${date}T23:59:59.999Z`);
+  for (let i = 0; i < 3; i++) {
+    const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }).formatToParts(guess).filter(x => x.type !== 'literal').map(x => [x.type, x.value]));
+    const localAsUtc = Date.UTC(p.year, Number(p.month) - 1, p.day, p.hour, p.minute, p.second, 999);
+    const intended = Date.parse(`${date}T23:59:59.999Z`); const delta = intended - localAsUtc;
+    if (!delta) break; guess = new Date(guess.getTime() + delta);
+  }
+  return guess.toISOString();
+}
+
+export function buildSnapshot(archive, now = new Date(), referralState = null, receipts = []) {
   assertArchive(archive);
   if (referralState) {
     try { referralState = migrateReferralState(referralState, { now }); validateReferralState(referralState); }
@@ -107,12 +132,15 @@ export function buildSnapshot(archive, now = new Date(), referralState = null) {
   const today = todayInZone(now, timeZone);
   const cutoff = new Date(`${today}T12:00:00Z`).getTime() - (29 * DAY_MS);
   const deduped = new Map();
+  const receiptByUrl = receiptTimes(receipts);
   for (const source of archive.jobs) {
     const scanAt = new Date(`${source.scanDate}T12:00:00Z`).getTime();
     if (scanAt < cutoff) continue;
     const applyUrl = canonicalUrl(source.applyUrl);
     const key = `${source.scanDate}|${applyUrl}`;
-    const job = { ...source, id: applyUrl, applyUrl, score: Number(source.score), referralContacts: [] };
+    const exact = source.scannedAt || receiptByUrl.get(applyUrl);
+    const job = { ...source, id: applyUrl, applyUrl, score: Number(source.score), referralContacts: [],
+      scannedAt: exact || dayEnd(source.scanDate, timeZone), scannedAtPrecision: source.scannedAt ? 'explicit' : exact ? 'receipt' : 'day-end-fallback' };
     const current = deduped.get(key);
     if (!current || job.score > current.score) deduped.set(key, job);
   }
@@ -129,7 +157,7 @@ export function buildSnapshot(archive, now = new Date(), referralState = null) {
   };
 }
 
-export function refreshSnapshot({ archivePath, referralPath, outputPath, now = new Date() }) {
+export function refreshSnapshot({ archivePath, referralPath, outputPath, receiptDirectory, now = new Date() }) {
   const archive = JSON.parse(readFileSync(archivePath, 'utf8'));
   let referralState = null;
   let invalidReferral = false;
@@ -137,7 +165,9 @@ export function refreshSnapshot({ archivePath, referralPath, outputPath, now = n
     try { referralState = loadAndMigrateReferralState(referralPath, { now, write: false }); invalidReferral = !validReferralState(referralState); }
     catch { invalidReferral = true; }
   }
-  const snapshot = buildSnapshot(archive, now, invalidReferral ? { sourceStatus: 'error', matches: [], updatedAt: null } : referralState);
+  const receiptDir = receiptDirectory || resolve(dirname(archivePath), 'company-discovery/receipts');
+  const receipts = existsSync(receiptDir) ? requireReceipts(receiptDir) : [];
+  const snapshot = buildSnapshot(archive, now, invalidReferral ? { sourceStatus: 'error', matches: [], updatedAt: null } : referralState, receipts);
   if (invalidReferral) {
     let previous = null; try { previous = JSON.parse(readFileSync(outputPath, 'utf8')); } catch {}
     const cache = cachedContacts(previous, now);
@@ -156,6 +186,10 @@ export function refreshSnapshot({ archivePath, referralPath, outputPath, now = n
   return snapshot;
 }
 
+function requireReceipts(directory) {
+  try { return readdirSync(directory).filter(name => name.endsWith('.json')).map(name => { try { return JSON.parse(readFileSync(join(directory, name), 'utf8')); } catch { return null; } }).filter(Boolean); } catch { return []; }
+}
+
 function main() {
   const checkoutRoot = resolve(import.meta.dirname, '../..');
   const dataRoot = getCareerOpsRoot();
@@ -164,6 +198,9 @@ function main() {
   const referralPath = resolve(process.argv[4] || `${dataRoot}/data/sunny-linkedin-referrals.json`);
   if (!existsSync(archivePath)) throw new Error(`Sunny archive not found at ${archivePath}. Existing snapshot was preserved.`);
   const snapshot = refreshSnapshot({ archivePath, referralPath, outputPath });
+  // Status has independent durable inputs; refresh it even when this command is
+  // later adapted to tolerate a jobs-snapshot failure.
+  refreshScanStatusSnapshot({ dataRoot, outputPath: resolve(checkoutRoot, 'local/sunny-job-search/data/scan-status.json') });
   console.log(`Sunny snapshot refreshed: ${snapshot.jobs.length} jobs (${snapshot.jobs.at(-1).scanDate} to ${snapshot.jobs[0].scanDate}).`);
 }
 

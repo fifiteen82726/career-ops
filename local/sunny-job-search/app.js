@@ -1,3 +1,4 @@
+import { calendarRange, renderScanStatus, statusRowsForFilters, todayWindow } from './scan-status.js';
 const PRIORITY_RANK = { priority: 0, suggested: 1, low: 2 };
 const searchableFields = ['scanDate', 'priority', 'priorityLabel', 'score', 'company', 'title', 'category', 'location', 'workMode', 'postedDate', 'primaryGap', 'resume', 'recommendation', 'referralMessage', 'applyUrl', 'recommendationUrl', 'linkedinPeopleUrl'];
 
@@ -17,8 +18,14 @@ function normalized(value) {
 
 export function filterJobs(jobs, filters) {
   const query = normalized(filters.query).trim();
+  const timeMatches = job => {
+    if (!filters.windowStart || !filters.windowEnd) return job.scanDate >= filters.start && job.scanDate <= filters.end;
+    const at = new Date(job.scannedAt || `${job.scanDate}T23:59:59.999Z`);
+    if (job.scannedAtPrecision === 'day-end-fallback') return job.scanDate <= filters.end && Math.min(at.getTime(), filters.windowEnd.getTime()) >= filters.windowStart.getTime();
+    return at >= filters.windowStart && at <= filters.windowEnd;
+  };
   return jobs.filter(job => filters.priorities.has(job.priority)
-    && job.scanDate >= filters.start && job.scanDate <= filters.end
+    && timeMatches(job)
     && (!filters.referralsOnly || hasReferralContacts(job))
     && (!query || searchableFields.some(field => normalized(job[field]).includes(query)) || normalized(referralSearchText(job)).includes(query)));
 }
@@ -216,9 +223,11 @@ async function initialize() {
     const snapshot = await response.json();
     if (snapshot.schemaVersion !== 1 || !Array.isArray(snapshot.jobs)) throw new Error('invalid snapshot');
     const today = localToday(snapshot.timeZone || 'America/New_York');
-    const state = { filters: defaultFilters(today), sort: { key: 'default', direction: 'desc' }, connectionSelections: new Map() };
+    const timeZone = snapshot.timeZone || 'America/New_York'; const state = { filters: { ...defaultFilters(today), ...todayWindow(new Date(), timeZone) }, sort: { key: 'default', direction: 'desc' }, connectionSelections: new Map(), statusDays: [] };
     const table = document.querySelector('table'); const query = document.querySelector('#query'); const start = document.querySelector('#start-date'); const end = document.querySelector('#end-date'); const resultCount = document.querySelector('#result-count'); const referralsOnly = document.querySelector('#referrals-only');
     const connectionsList = document.querySelector('#connections-list'); const connectionsCount = document.querySelector('#connections-count'); const connectionsEmpty = document.querySelector('#connections-empty');
+    const statusBody = document.querySelector('#scan-status tbody'); const statusError = document.querySelector('#scan-status-error');
+    fetch('./data/scan-status.json', { cache: 'no-store' }).then(response => { if (!response.ok) throw new Error(`HTTP ${response.status}`); return response.json(); }).then(doc => { if (doc.schemaVersion !== 1 || !Array.isArray(doc.days)) throw new Error('invalid status'); state.statusDays = doc.days; update(); }).catch(() => { statusError.hidden = false; statusError.textContent = '無法載入掃描狀態；顯示未執行日期。'; update(); });
     const dialog = document.querySelector('#referral-dialog'); const dialogContext = document.querySelector('#referral-dialog-context'); const editor = document.querySelector('#referral-message-editor');
     document.querySelector('#referral-status').textContent = referralStatus(snapshot);
     start.value = state.filters.start; end.value = state.filters.end;
@@ -237,12 +246,13 @@ async function initialize() {
       state.filters.priorities = new Set([...document.querySelectorAll('[data-priority]:checked')].map(input => input.dataset.priority)); state.filters.referralsOnly = referralsOnly.checked;
       if (!state.filters.start || !state.filters.end || state.filters.start > state.filters.end) { error.hidden = false; error.textContent = '日期範圍無效：開始日期必須早於或等於結束日期。'; return; }
       error.hidden = true; const visible = sortJobs(filterJobs(snapshot.jobs, state.filters), state.sort); renderRows(table, visible, notice); resultCount.textContent = `${visible.length} 個結果`;
+      renderScanStatus(statusBody, statusRowsForFilters(state.statusDays, state.filters, timeZone));
       const referralJobs = sortJobs(filterReferralJobs(snapshot.jobs, state.filters), state.sort); const groups = groupReferralConnections(referralJobs); pruneConnectionSelections(state.connectionSelections, groups); renderConnections(connectionsList, groups, state.connectionSelections, openMessage);
       connectionsCount.textContent = `${groups.length} 位可聯絡`; connectionsEmpty.hidden = groups.length > 0;
     };
     query.addEventListener('input', update);
-    for (const input of document.querySelectorAll('[data-priority], #start-date, #end-date, #referrals-only')) input.addEventListener('change', () => { if (input.matches('#start-date, #end-date')) document.querySelectorAll('[data-range]').forEach(button => { button.classList.remove('active'); button.setAttribute('aria-pressed', 'false'); }); update(); });
-    for (const button of document.querySelectorAll('[data-range]')) button.addEventListener('click', () => { const range = quickRange(today, Number(button.dataset.range)); start.value = range.start; end.value = range.end; document.querySelectorAll('[data-range]').forEach(candidate => { const active = candidate === button; candidate.classList.toggle('active', active); candidate.setAttribute('aria-pressed', String(active)); }); update(); });
+    for (const input of document.querySelectorAll('[data-priority], #start-date, #end-date, #referrals-only')) input.addEventListener('change', () => { if (input.matches('#start-date, #end-date')) { delete state.filters.windowStart; delete state.filters.windowEnd; document.querySelectorAll('[data-range]').forEach(button => { button.classList.remove('active'); button.setAttribute('aria-pressed', 'false'); }); } update(); });
+    for (const button of document.querySelectorAll('[data-range]')) button.addEventListener('click', () => { const range = button.dataset.range === 'today' ? todayWindow(new Date(), timeZone) : calendarRange(new Date(), Number(button.dataset.range), timeZone); Object.assign(state.filters, range); start.value = range.start; end.value = range.end; document.querySelectorAll('[data-range]').forEach(candidate => { const active = candidate === button; candidate.classList.toggle('active', active); candidate.setAttribute('aria-pressed', String(active)); }); update(); });
     for (const button of document.querySelectorAll('th button[data-sort]')) button.addEventListener('click', () => { const key = button.dataset.sort; state.sort = { key, direction: state.sort.key === key && state.sort.direction === 'desc' ? 'asc' : 'desc' }; document.querySelectorAll('th[data-sort]').forEach(header => { const active = header.dataset.sort === key; header.setAttribute('aria-sort', active ? (state.sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'); header.querySelector('button').textContent = `${header.dataset.label} ${active ? (state.sort.direction === 'asc' ? '↑' : '↓') : '↕'}`; }); update(); });
     update();
   } catch (cause) { error.hidden = false; error.textContent = '無法載入本機職缺快照。請執行 refresh 指令後重新整理頁面。'; console.error(cause); }

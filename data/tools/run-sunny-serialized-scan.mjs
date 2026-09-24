@@ -22,6 +22,7 @@ import { statePaths } from './sunny-company-state.mjs';
 import { enqueueScanReceipt } from './sunny-job-queue.mjs';
 import { ingestScanReceiptExceptions } from './sunny-scan-exception-queue.mjs';
 import { withSunnyRoutineLease } from './sunny-routine-runtime.mjs';
+import { refreshScanStatusSnapshot } from './build-sunny-scan-status.mjs';
 
 const CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const PARTIAL_PATTERN = /\b(?:partial|truncat(?:ed|ion)?|page cap|max_pages|budget exhausted)\b/i;
@@ -129,6 +130,7 @@ export async function runSerializedScan({
   runId: suppliedRunId,
   lockOptions,
   routineLease = kind === 'daily',
+  refreshStatus = refreshScanStatusSnapshot,
 } = {}) {
   if (!['daily', 'backfill'].includes(kind)) throw new Error('scan kind must be daily or backfill');
   if (kind === 'backfill') {
@@ -230,7 +232,9 @@ export async function runSerializedScan({
     if (temporaryPortals) {
       try { unlinkSync(temporaryPortals); } catch { /* preserve receipt even if cleanup races */ }
     }
-    return { ...receipt, receipt_path: receiptPath, scan_exceptions: { recorded: scanExceptionResult.recorded } };
+    let status_snapshot_warning = '';
+    try { refreshStatus({ dataRoot: paths.root }); } catch (error) { status_snapshot_warning = String(error?.message || error); }
+    return { ...receipt, receipt_path: receiptPath, scan_exceptions: { recorded: scanExceptionResult.recorded }, ...(status_snapshot_warning ? { status_snapshot_warning } : {}) };
   }, { dataRoot, lockOptions });
   // Company backfills run under their parent's lease. Reacquiring here would
   // deadlock the exact-board child against the company run that owns it.
