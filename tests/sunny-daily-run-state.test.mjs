@@ -121,6 +121,34 @@ test('requires durable candidate disposition and refuses a fabricated published 
   await assert.rejects(checkpointBatch({ dataRoot, batchId: state.current_batch.id, outcomes: [{ key: url, status: 'deferred', evidence: { reason: 'fake' } }] }), /exception|durable/i);
 });
 
+test('local-only publication closes with archive and index evidence but no Sheet sinks', async t => {
+  const dataRoot = root(t); const url = 'https://example.com/local';
+  queue(dataRoot, [{ url, status: 'published', publication_ref: `data/sunny-job-search-archive.json#${url}` }]);
+  const state = await startOrResumeRun({ dataRoot, batch: { type: 'normal', members: [url] } });
+  const payload = fixturePayload(url);
+  payload.archive_values = { action: 'published-local', archive_path: 'data/sunny-job-search-archive.json', index_path: 'local/sunny-job-search/data/jobs.json' };
+  payload.link_values = { url, publication_ref: `data/sunny-job-search-archive.json#${url}` };
+  payload.operations = {
+    date_tab: { status: 'not_applicable', reference: 'local-only' },
+    master: { status: 'not_applicable', reference: 'local-only' },
+    excluded: { status: 'not_applicable', reference: 'published' },
+    seen_jobs: { status: 'done', reference: 'receipt' },
+    scan_summary: { status: 'done', reference: 'summary' },
+    archive: { status: 'done', reference: 'data/sunny-job-search-archive.json' },
+    index: { status: 'done', reference: 'local/sunny-job-search/data/jobs.json' },
+    queue_disposition: { status: 'done', reference: 'queue' },
+  };
+  await checkpointBatch({ dataRoot, batchId: state.current_batch.id, payload, outcomes: [{ key: url, status: 'published', evidence: { publication: 'local' } }] });
+
+  const closed = await closeBatch({ dataRoot, batchId: state.current_batch.id, closeout: closeout({
+    seen_jobs: { status: 'updated', reference: 'receipt' },
+    queue_disposition: { status: 'updated', reference: 'queue' },
+    archive: { status: 'updated', reference: 'data/sunny-job-search-archive.json' },
+    index: { status: 'updated', reference: 'local/sunny-job-search/data/jobs.json' },
+  }) });
+  assert.equal(closed.current_batch, null);
+});
+
 test('close is idempotent, increments counters once, and final zero closeout requires scan summary', async t => {
   const dataRoot = root(t); const state = await startOrResumeRun({ dataRoot, batch: { type: 'final_closeout', members: [] } });
   const closeoutReceipt = closeout();

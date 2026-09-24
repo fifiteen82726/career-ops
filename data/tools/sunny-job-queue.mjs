@@ -9,6 +9,21 @@ import { isMainModule } from '../../lib/is-main-module.mjs';
 import { canonicalLeadUrl } from './sunny-company-leads.mjs';
 
 function queuePath(dataRoot) { return join(dataRoot, 'data/sunny-job-queue.json'); }
+function verifiedSheetRef(value) {
+  return /^https:\/\/docs\.google\.com\/spreadsheets\/d\/[^/]+\/.*(?:range=|!)/.test(String(value || ''));
+}
+function documentJobs(path) {
+  if (!existsSync(path)) return [];
+  const doc = JSON.parse(readFileSync(path, 'utf8'));
+  return Array.isArray(doc) ? doc : doc.jobs || doc.items || [];
+}
+function verifiedLocalPublication(dataRoot, url) {
+  const identity = value => canonicalLeadUrl(value).replace(/\/$/, '');
+  const canonical = identity(url);
+  const contains = path => documentJobs(path).some(item => identity(item.id || item.url || item.applyUrl || '') === canonical);
+  return contains(join(dataRoot, 'data/sunny-job-search-archive.json'))
+    && contains(join(dataRoot, 'local/sunny-job-search/data/jobs.json'));
+}
 function readQueue(dataRoot) {
   const file = queuePath(dataRoot);
   if (!existsSync(file)) return { schema_version: 1, jobs: [] };
@@ -66,7 +81,7 @@ function mergeJobs(left, right) {
     throw new Error(`Conflicting terminal dispositions for ${left.url}`);
   }
   const winner = { ...left };
-  for (const field of ['title', 'company', 'location', 'posted_at', 'first_seen', 'reason', 'sheet_ref', 'disposition_at', 'exception_key', 'exception_at']) {
+  for (const field of ['title', 'company', 'location', 'posted_at', 'first_seen', 'reason', 'sheet_ref', 'publication_ref', 'disposition_at', 'exception_key', 'exception_at']) {
     if (!winner[field] && right[field]) winner[field] = right[field];
   }
   if (rightTerminal) winner.status = rightTerminal;
@@ -145,17 +160,20 @@ export async function enqueueScanReceipt(receipt, { dataRoot = getCareerOpsRoot(
   }, { dataRoot, ...options });
 }
 
-export async function markJobDisposition({ url, status, reason, sheet_ref }, options = {}) {
+export async function markJobDisposition({ url, status, reason, sheet_ref, publication_ref }, options = {}) {
   if (!['published', 'rejected', 'duplicate', 'closed'].includes(status)) throw new Error('Invalid job disposition');
-  if (status === 'published' && !/^https:\/\/docs\.google\.com\/spreadsheets\/d\/[^/]+\/.*(?:range=|!)/.test(sheet_ref || '')) {
-    throw new Error('Published disposition requires a verified Sheet URL with row/range reference');
+  const dataRoot = options.dataRoot || getCareerOpsRoot();
+  const localRef = status === 'published' && !verifiedSheetRef(sheet_ref) && verifiedLocalPublication(dataRoot, url)
+    ? publication_ref || `data/sunny-job-search-archive.json#${canonicalLeadUrl(url)}` : '';
+  if (status === 'published' && !verifiedSheetRef(sheet_ref) && !localRef) {
+    throw new Error('Published disposition requires a verified Sheet row or matching local archive and index evidence');
   }
   if (status !== 'published' && !String(reason || '').trim()) throw new Error('Disposition requires a reason');
   return updateQueue(doc => {
     const job = doc.jobs.find(item => item.url === canonicalLeadUrl(url));
     if (!job) throw new Error('Job not found in pending queue');
     if (job.status !== 'pending' && job.status !== status) throw new Error('Cannot overwrite a terminal disposition');
-    Object.assign(job, { status, reason: reason || '', sheet_ref: sheet_ref || '', disposition_at: new Date().toISOString() });
+    Object.assign(job, { status, reason: reason || '', sheet_ref: sheet_ref || '', publication_ref: localRef || '', disposition_at: new Date().toISOString() });
     return { url: job.url, status };
   }, options);
 }
@@ -199,16 +217,19 @@ export async function releaseJobFromException({ url, exception_key }, options = 
 
 /** Canonical candidate adapter transition: only the exception currently linked
  * to the job may convert it to a terminal outcome. */
-export async function terminalizeExceptionJob({ url, exception_key, status, reason = '', sheet_ref = '' }, options = {}) {
+export async function terminalizeExceptionJob({ url, exception_key, status, reason = '', sheet_ref = '', publication_ref = '' }, options = {}) {
   if (!['published', 'closed'].includes(status)) throw new Error('Exception terminal outcome must be published or closed');
-  if (status === 'published' && !/^https:\/\/docs\.google\.com\/spreadsheets\/d\/[^/]+\/.*(?:range=|!)/.test(sheet_ref)) throw new Error('Published terminal outcome requires verified Sheet reference');
+  const dataRoot = options.dataRoot || getCareerOpsRoot();
+  const localRef = status === 'published' && !verifiedSheetRef(sheet_ref) && verifiedLocalPublication(dataRoot, url)
+    ? publication_ref || `data/sunny-job-search-archive.json#${canonicalLeadUrl(url)}` : '';
+  if (status === 'published' && !verifiedSheetRef(sheet_ref) && !localRef) throw new Error('Published terminal outcome requires verified Sheet or local archive/index evidence');
   if (status === 'closed' && !String(reason).trim()) throw new Error('Closed terminal outcome requires official evidence');
   return updateQueue(doc => {
     const job = doc.jobs.find(item => item.url === canonicalLeadUrl(url));
     if (!job) throw new Error('Job not found in exception queue');
     if (job.status === status) return { url: job.url, status, replayed: true };
     if (job.status !== 'exception' || job.exception_key !== exception_key) throw new Error('Terminal outcome requires matching linked exception');
-    Object.assign(job, { status, reason, sheet_ref, exception_key: '', disposition_at: new Date().toISOString() });
+    Object.assign(job, { status, reason, sheet_ref, publication_ref: localRef, exception_key: '', disposition_at: new Date().toISOString() });
     return { url: job.url, status };
   }, options);
 }
@@ -236,8 +257,9 @@ if (isMainModule(import.meta.url)) {
     if (command === 'pending') return readPendingJobs({ limit: args.includes('--limit') ? Number(value('--limit')) : Infinity });
     if (command === 'reconcile') return reconcileScanReceipts();
     if (command === 'mark') return markJobDisposition({ url: value('--url'), status: value('--status'),
-      reason: args.includes('--reason') ? value('--reason') : '', sheet_ref: args.includes('--sheet-ref') ? value('--sheet-ref') : '' });
-    throw new Error('Usage: sunny-job-queue.mjs reconcile | pending [--limit N] | mark --url URL --status published|rejected|duplicate|closed [--reason TEXT] [--sheet-ref VERIFIED_RANGE_URL]');
+      reason: args.includes('--reason') ? value('--reason') : '', sheet_ref: args.includes('--sheet-ref') ? value('--sheet-ref') : '',
+      publication_ref: args.includes('--publication-ref') ? value('--publication-ref') : '' });
+    throw new Error('Usage: sunny-job-queue.mjs reconcile | pending [--limit N] | mark --url URL --status published|rejected|duplicate|closed [--reason TEXT] [--sheet-ref VERIFIED_RANGE_URL] [--publication-ref LOCAL_REFERENCE]');
   }).then(result => console.log(JSON.stringify(result, null, 2))).catch(error => {
     console.error(error.message); process.exitCode = 1;
   });

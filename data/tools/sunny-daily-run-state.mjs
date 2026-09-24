@@ -263,21 +263,32 @@ export async function checkpointBatch({ dataRoot = getCareerOpsRoot(), batchId, 
   }, lockOptions);
 }
 const SINKS = ['date_tab', 'master', 'excluded', 'seen_jobs', 'scan_summary', 'archive', 'index', 'queue_disposition'];
-function requiredSinks(batch) {
+function localOnlyPublication(payload) {
+  return payload?.archive_values?.action === 'published-local'
+    || Boolean(payload?.link_values?.publication_ref && !payload?.link_values?.sheet_ref);
+}
+function requiredSinks(batch, artifact) {
   const outcomes = batch.outcomes;
   const candidate = batch.type === 'normal' || batch.type === 'candidate_retry';
   const required = new Set(['scan_summary']);
   if (candidate && outcomes.length) { required.add('seen_jobs'); required.add('queue_disposition'); }
   if (outcomes.some(outcome => ['rejected', 'closed'].includes(outcome.status))) required.add('excluded');
-  if (outcomes.some(outcome => outcome.status === 'published')) for (const sink of ['date_tab', 'master', 'archive', 'index']) required.add(sink);
+  for (const outcome of outcomes.filter(item => item.status === 'published')) {
+    const payload = artifact.payloads[canonicalMember(outcome.key)];
+    for (const sink of ['archive', 'index']) required.add(sink);
+    if (!localOnlyPublication(payload)) for (const sink of ['date_tab', 'master']) required.add(sink);
+  }
   return required;
 }
-function requiredOperations(batch, outcome) {
+function requiredOperations(batch, outcome, payload) {
   const candidate = batch.type === 'normal' || batch.type === 'candidate_retry';
   const names = new Set(['scan_summary']);
   if (candidate) { names.add('seen_jobs'); names.add('queue_disposition'); }
   if (['rejected', 'closed'].includes(outcome.status)) names.add('excluded');
-  if (outcome.status === 'published') for (const name of ['date_tab', 'master', 'archive', 'index']) names.add(name);
+  if (outcome.status === 'published') {
+    for (const name of ['archive', 'index']) names.add(name);
+    if (!localOnlyPublication(payload)) for (const name of ['date_tab', 'master']) names.add(name);
+  }
   return names;
 }
 export async function closeBatch({ dataRoot = getCareerOpsRoot(), batchId, closeout, now = new Date(), lockOptions } = {}) {
@@ -290,18 +301,18 @@ export async function closeBatch({ dataRoot = getCareerOpsRoot(), batchId, close
       throw new Error('Current batch ID is required');
     }
     if (batch.outcomes.length !== batch.members.length) throw new Error('Cannot close batch before every member has an outcome');
-    const required = requiredSinks(batch);
+    const artifact = payloadDocument(dataRoot, batch);
+    const required = requiredSinks(batch, artifact);
     for (const sink of SINKS) {
       const value = closeout?.[sink];
       if (!value || !['updated', 'not_applicable'].includes(value.status) || !value.reference) throw new Error(`Closeout evidence required for ${sink}`);
       if (required.has(sink) && value.status !== 'updated') throw new Error(`${sink.replace(/_/g, ' ')} sink is required for durable outcomes`);
     }
     if (batch.type === 'final_closeout' && closeout.scan_summary.status !== 'updated') throw new Error('Scan Summary is required for final closeout');
-    const artifact = payloadDocument(dataRoot, batch);
     for (const outcome of batch.outcomes) {
       const saved = artifact.payloads[canonicalMember(outcome.key)];
       if (!saved) continue; // pre-v2 interrupted batches have no per-member artifact.
-      for (const operation of requiredOperations(batch, outcome)) {
+      for (const operation of requiredOperations(batch, outcome, saved)) {
         if (saved.operations?.[operation]?.status !== 'done') throw new Error(`${operation.replace(/_/g, ' ')} operation is unfinished for ${outcome.key}`);
       }
     }

@@ -80,6 +80,25 @@ test('disposition needs evidence and replay never reopens processed work', async
   assert.equal(all.jobs[0].status, 'published');
 });
 
+test('local archive and index evidence can terminally publish without Google Sheet', async t => {
+  const dataRoot = root(t);
+  await queue.enqueueScanReceipt(receipt, { dataRoot });
+  mkdirSync(join(dataRoot, 'local/sunny-job-search/data'), { recursive: true });
+  writeFileSync(join(dataRoot, 'data/sunny-job-search-archive.json'), JSON.stringify([{ id: url }]));
+  writeFileSync(join(dataRoot, 'local/sunny-job-search/data/jobs.json'), JSON.stringify([{ id: url }]));
+
+  await queue.markJobDisposition({
+    url,
+    status: 'published',
+    publication_ref: `data/sunny-job-search-archive.json#${url}`,
+  }, { dataRoot });
+
+  const stored = JSON.parse(readFileSync(join(dataRoot, 'data/sunny-job-queue.json'), 'utf8')).jobs[0];
+  assert.equal(stored.status, 'published');
+  assert.match(stored.publication_ref, /sunny-job-search-archive/);
+  assert.equal(stored.sheet_ref, '');
+});
+
 test('dry scans do not enqueue and concurrent runs do not lose jobs', async t => {
   const dataRoot = root(t);
   await queue.enqueueScanReceipt({ ...receipt, dry_run: true }, { dataRoot });
@@ -398,6 +417,31 @@ test('verified publication and official expiry terminalize the linked exception 
   await queue.enqueueScanReceipt({ ...receipt, run_id: 'backfill-2', scan_receipt: { ...receipt.scan_receipt, added_urls: [closedUrl] } }, { dataRoot });
   await applyCandidateOutcome({ outcome: 'failure', url: closedUrl, stage: 'jd', attempt_id: 'closed-1', attempt_at: '2026-09-01T00:00:00.000Z', message: 'official HTTP 404 job no longer available' }, { dataRoot });
   assert.equal(JSON.parse(readFileSync(join(dataRoot, 'data/sunny-job-queue.json'))).jobs.find(job => job.url === closedUrl).status, 'closed');
+});
+
+test('verified local publication terminalizes a publish-closeout exception', async t => {
+  const dataRoot = root(t);
+  const localUrl = 'https://example.com/local-publication/';
+  await queue.enqueueScanReceipt({ ...receipt, scan_receipt: { ...receipt.scan_receipt, added_urls: [localUrl] } }, { dataRoot });
+  const { applyCandidateOutcome } = await import('../data/tools/sunny-job-exception-queue.mjs');
+  await applyCandidateOutcome({ outcome: 'failure', url: localUrl, stage: 'publish-closeout', attempt_id: 'local-1', attempt_at: '2026-09-01T00:00:00.000Z', message: 'local archive already written' }, { dataRoot });
+  mkdirSync(join(dataRoot, 'local/sunny-job-search/data'), { recursive: true });
+  writeFileSync(join(dataRoot, 'data/sunny-job-search-archive.json'), JSON.stringify([{ id: localUrl }]));
+  writeFileSync(join(dataRoot, 'local/sunny-job-search/data/jobs.json'), JSON.stringify([{ id: localUrl.slice(0, -1) }]));
+
+  await applyCandidateOutcome({
+    outcome: 'resolve',
+    url: localUrl,
+    stage: 'publish-closeout',
+    evidence: {
+      archive_reference: `data/sunny-job-search-archive.json#${localUrl}`,
+      index_reference: `local/sunny-job-search/data/jobs.json#${localUrl}`,
+      publication_ref: `data/sunny-job-search-archive.json#${localUrl}`,
+    },
+  }, { dataRoot });
+
+  assert.equal(JSON.parse(readFileSync(join(dataRoot, 'data/sunny-job-queue.json'), 'utf8')).jobs[0].status, 'published');
+  assert.equal(readExceptionQueue({ dataRoot, queue: 'candidate' })[0].status, 'resolved');
 });
 
 test('a later official expiry closes an already-linked candidate exception and preserves resolution evidence', async t => {

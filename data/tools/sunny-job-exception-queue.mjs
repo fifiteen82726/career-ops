@@ -155,7 +155,8 @@ async function resolveCandidateExceptionUnlocked({ url, stage, terminal_status, 
   const released = !terminal_status && needsNewNormalEvaluation(item)
     && alreadyDeferred(dataRoot, canonicalUrl, key);
   if (terminal_status) await terminalizeExceptionJob({ url: canonicalUrl, exception_key: key, status: terminal_status,
-    reason: terminal_status === 'closed' ? String(evidence?.official_expiry || evidence?.reason || 'official posting expiry') : '', sheet_ref: evidence?.sheet_ref || evidence?.master_reference || '' }, { dataRoot, lockOptions });
+    reason: terminal_status === 'closed' ? String(evidence?.official_expiry || evidence?.reason || 'official posting expiry') : '',
+    sheet_ref: evidence?.sheet_ref || evidence?.master_reference || '', publication_ref: evidence?.publication_ref || evidence?.archive_reference || '' }, { dataRoot, lockOptions });
   else if (released) await releaseJobFromException({ url: canonicalUrl, exception_key: key }, { dataRoot, lockOptions });
   await markResolved(key, evidence, { dataRoot, lockOptions });
   return { key, status: 'resolved', released };
@@ -181,11 +182,13 @@ export async function applyCandidateOutcome(input = {}, options = {}) {
     terminalize_closed: true,
   }, { ...options, dataRoot });
   if (input.outcome === 'resolve') {
-    if (['publish', 'archive', 'index'].includes(input.stage)
-      && (!input.evidence?.date_tab_reference || !input.evidence?.master_reference)) {
-      throw new Error('Publication repair requires verified date-tab and Master references');
+    const publicationStages = ['publish', 'publish-closeout', 'archive', 'index'];
+    const sheetEvidence = input.evidence?.date_tab_reference && input.evidence?.master_reference;
+    const localEvidence = input.evidence?.archive_reference && input.evidence?.index_reference;
+    if (publicationStages.includes(input.stage) && !sheetEvidence && !localEvidence) {
+      throw new Error('Publication repair requires verified Sheet references or local archive and index references');
     }
-    const terminal_status = ['publish', 'archive', 'index'].includes(input.stage) ? 'published' : undefined;
+    const terminal_status = publicationStages.includes(input.stage) ? 'published' : undefined;
     return resolveCandidateException({ url: input.url, stage: input.stage, terminal_status, evidence: input.evidence }, { ...options, dataRoot });
   }
   throw new Error('Candidate outcome must be failure or resolve');
