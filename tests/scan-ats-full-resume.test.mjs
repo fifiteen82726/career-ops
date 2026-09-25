@@ -197,6 +197,23 @@ const { loadCheckpoint, checkpointCompatible } = mod;
   }
 }
 
+// ── paylocity SOURCES wiring ────────────────────────────────────────
+// The public directory has UUID board keys. A valid 8-4-4-4-12 key must
+// survive the source gate and remain detectable by the provider; otherwise an
+// entire reverse-ATS dataset is silently discarded before any scan work starts.
+{
+  const { SOURCES } = mod;
+  const row = { guid: '11111111-2222-3333-4444-555555555555', jobs: 4, name: 'Fixture' };
+  const entry = SOURCES?.paylocity?.toEntry(row);
+  if (entry && entry.name === 'Fixture'
+      && entry.careers_url === 'https://recruiting.paylocity.com/recruiting/jobs/All/11111111-2222-3333-4444-555555555555/'
+      && SOURCES.paylocity.provider?.detect(entry)?.url === entry.careers_url) {
+    pass('paylocity valid UUID dataset row becomes a detectable source entry');
+  } else {
+    fail(`paylocity valid UUID row was rejected or undetectable: ${JSON.stringify(entry)}`);
+  }
+}
+
 // ── cappedBoards reaches the --json payload ─────────────────────────
 // The --json object exists so a caller can tell a *degraded* sweep apart from
 // an empty one. A page-capped board is exactly that: coverage is partial, so a

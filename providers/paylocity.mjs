@@ -4,6 +4,7 @@
 import { decodeEntities } from './_html-entities.mjs';
 import { fetchTextWithRetry } from './_http.mjs';
 import { createHostPacer } from './_host-pacer.mjs';
+import { safeEncodeURIComponent } from './_safe-url.mjs';
 
 const HOST = 'recruiting.paylocity.com';
 const GUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
@@ -33,7 +34,9 @@ export function parsePaylocityPage(html, companyName) {
   let data;
   try { data = JSON.parse(match[1]); } catch { return []; }
   if (!Array.isArray(data?.Jobs)) return [];
-  return data.Jobs.filter(job => job?.JobId && job?.JobTitle).map(job => {
+  return data.Jobs.filter(job => job?.JobId && job?.JobTitle).flatMap(job => {
+    const encodedId = safeEncodeURIComponent(job.JobId);
+    if (!encodedId) return [];
     const location = [job?.JobLocation?.City, job?.JobLocation?.State, job?.IsRemote ? 'Remote' : '']
       .map(value => text(value)).filter(Boolean).join(', ')
       || text(job?.LocationName);
@@ -41,7 +44,7 @@ export function parsePaylocityPage(html, companyName) {
     const description = text(job?.Description);
     return {
       title: text(job.JobTitle),
-      url: `https://${HOST}/recruiting/Jobs/Details/${encodeURIComponent(String(job.JobId))}`,
+      url: `https://${HOST}/recruiting/Jobs/Details/${encodedId}`,
       company: companyName,
       location,
       ...(Number.isFinite(postedAt) ? { postedAt } : {}),

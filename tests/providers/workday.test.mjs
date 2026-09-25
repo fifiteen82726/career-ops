@@ -337,60 +337,28 @@ try {
     fail(`parseWorkdayResponse(cxs api) row 0 = ${JSON.stringify(cxsJobs[0])}`);
   }
 
-  // Modern Workday hostname: /recruiting/{tenant}/{site} carries the
-  // tenant in the path because the instance host is shared by employers.
+  // Modern Workday hosts share an instance hostname, so their tenant is part
+  // of the dedup identity rather than an incidental site path.
   const hitMyWorkdaySite = workday.detect({
     name: 'Brevan Howard',
     careers_url: 'https://wd3.myworkdaysite.com/recruiting/brevanhoward/BH_ExternalCareers',
   });
-  if (hitMyWorkdaySite?.url === 'https://wd3.myworkdaysite.com/wday/cxs/brevanhoward/BH_ExternalCareers/jobs') {
-    pass('workday.detect() resolves myworkdaysite recruiting URL to CXS API endpoint');
-  } else {
-    fail(`workday.detect(myworkdaysite) returned ${JSON.stringify(hitMyWorkdaySite)}`);
-  }
+  if (hitMyWorkdaySite?.url === 'https://wd3.myworkdaysite.com/wday/cxs/brevanhoward/BH_ExternalCareers/jobs') pass('workday.detect() resolves myworkdaysite recruiting URL to CXS API endpoint');
+  else fail(`workday.detect(myworkdaysite) returned ${JSON.stringify(hitMyWorkdaySite)}`);
+  const directModernCxs = workday.detect({ name: 'Brevan Howard', api: 'https://wd3.myworkdaysite.com/wday/cxs/brevanhoward/BH_ExternalCareers/jobs' });
+  if (directModernCxs?.url === 'https://wd3.myworkdaysite.com/wday/cxs/brevanhoward/BH_ExternalCareers/jobs') pass('workday.detect() accepts a direct myworkdaysite CXS URL');
+  else fail(`workday.detect(modern CXS) returned ${JSON.stringify(directModernCxs)}`);
+  const modernCrossSiteA = workdayDedupKey({ url: 'https://wd3.myworkdaysite.com/recruiting/brevanhoward/BH_ExternalCareers/job/London/Data-Engineer_JR00123' });
+  const modernCrossSiteB = workdayDedupKey({ url: 'https://wd3.myworkdaysite.com/recruiting/brevanhoward/BH_Indeed/job/London/Data-Engineer_JR00123-2' });
+  if (modernCrossSiteA === 'workday:wd3.myworkdaysite.com:brevanhoward:jr00123' && modernCrossSiteA === modernCrossSiteB) pass('workdayDedupKey() collapses modern sites within the same tenant');
+  else fail(`workdayDedupKey() modern cross-site collapse failed: ${JSON.stringify({ modernCrossSiteA, modernCrossSiteB })}`);
+  const modernOtherTenant = workdayDedupKey({ url: 'https://wd3.myworkdaysite.com/recruiting/anothercompany/Careers/job/London/Data-Engineer_JR00123' });
+  if (modernCrossSiteA && modernOtherTenant && modernCrossSiteA !== modernOtherTenant) pass('workdayDedupKey() keeps identical requisitions from different modern tenants separate');
+  else fail(`workdayDedupKey() modern tenant scope failed: ${JSON.stringify({ modernCrossSiteA, modernOtherTenant })}`);
+  const modernJobs = parseWorkdayResponse({ jobPostings: [{ title: 'Data Engineer', externalPath: '/job/London/Data-Engineer_JR00123' }] }, { name: 'Brevan Howard', careers_url: 'https://wd3.myworkdaysite.com/recruiting/brevanhoward/BH_ExternalCareers' });
+  if (modernJobs[0]?.url === 'https://wd3.myworkdaysite.com/recruiting/brevanhoward/BH_ExternalCareers/job/London/Data-Engineer_JR00123') pass('parseWorkdayResponse builds modern recruiting posting URLs');
+  else fail(`parseWorkdayResponse modern URL returned ${JSON.stringify(modernJobs[0]?.url)}`);
 
-  const directModernCxs = workday.detect({
-    name: 'Brevan Howard',
-    api: 'https://wd3.myworkdaysite.com/wday/cxs/brevanhoward/BH_ExternalCareers/jobs',
-  });
-  if (directModernCxs?.url === 'https://wd3.myworkdaysite.com/wday/cxs/brevanhoward/BH_ExternalCareers/jobs') {
-    pass('workday.detect() accepts a direct myworkdaysite CXS URL');
-  } else {
-    fail(`workday.detect(modern CXS) returned ${JSON.stringify(directModernCxs)}`);
-  }
-
-  const modernCrossSiteA = workdayDedupKey({
-    url: 'https://wd3.myworkdaysite.com/recruiting/brevanhoward/BH_ExternalCareers/job/London/Data-Engineer_JR00123',
-  });
-  const modernCrossSiteB = workdayDedupKey({
-    url: 'https://wd3.myworkdaysite.com/recruiting/brevanhoward/BH_Indeed/job/London/Data-Engineer_JR00123-2',
-  });
-  if (modernCrossSiteA === 'workday:wd3.myworkdaysite.com:brevanhoward:jr00123' && modernCrossSiteA === modernCrossSiteB) {
-    pass('workdayDedupKey() collapses modern sites within the same tenant');
-  } else {
-    fail(`workdayDedupKey() modern cross-site collapse failed: ${JSON.stringify({ modernCrossSiteA, modernCrossSiteB })}`);
-  }
-
-  const modernOtherTenant = workdayDedupKey({
-    url: 'https://wd3.myworkdaysite.com/recruiting/anothercompany/Careers/job/London/Data-Engineer_JR00123',
-  });
-  if (modernCrossSiteA && modernOtherTenant && modernCrossSiteA !== modernOtherTenant) {
-    pass('workdayDedupKey() keeps identical requisitions from different modern tenants separate');
-  } else {
-    fail(`workdayDedupKey() modern tenant scope failed: ${JSON.stringify({ modernCrossSiteA, modernOtherTenant })}`);
-  }
-
-  const modernJobs = parseWorkdayResponse({
-    jobPostings: [{ title: 'Data Engineer', externalPath: '/job/London/Data-Engineer_JR00123' }],
-  }, {
-    name: 'Brevan Howard',
-    careers_url: 'https://wd3.myworkdaysite.com/recruiting/brevanhoward/BH_ExternalCareers',
-  });
-  if (modernJobs[0]?.url === 'https://wd3.myworkdaysite.com/recruiting/brevanhoward/BH_ExternalCareers/job/London/Data-Engineer_JR00123') {
-    pass('parseWorkdayResponse builds modern recruiting posting URLs');
-  } else {
-    fail(`parseWorkdayResponse modern URL returned ${JSON.stringify(modernJobs[0]?.url)}`);
-  }
   // Path-spoofed URL: myworkdayjobs.com in path, not hostname
   if (workday.detect({ name: 'Spoof', careers_url: 'https://evil.example/test.wd5.myworkdayjobs.com/en-US/board' }) === null) {
     pass('workday.detect() rejects path-spoofed URL');

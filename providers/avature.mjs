@@ -37,6 +37,8 @@ const HARD_MAX_PAGES = 200;
 const INTER_PAGE_DELAY_MS = 250;
 // The bare key we self-heal to when the primary (`jobOffset`) proves inert.
 const FALLBACK_OFFSET_PARAM = 'offset';
+const PRIMARY_OFFSET_PARAM = 'jobOffset';
+const RESERVED_PAGINATION_KEYS = new Set([PRIMARY_OFFSET_PARAM, FALLBACK_OFFSET_PARAM].map(key => key.toLowerCase()));
 
 const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
 
@@ -53,7 +55,11 @@ function resolveConfig(entry) {
   // Honour an explicit SearchJobs path (branded tenants may prefix a locale,
   // e.g. /en_US/searchjobs/SearchJobs); otherwise default to the classic path.
   const searchPath = /\/SearchJobs\b/i.test(u.pathname) ? u.pathname.replace(/\/+$/, '') : '/careers/SearchJobs';
-  return { searchUrl: `${u.origin}${searchPath}`, origin: u.origin };
+  const extraParams = new URLSearchParams(u.search);
+  for (const key of [...extraParams.keys()]) {
+    if (RESERVED_PAGINATION_KEYS.has(key.toLowerCase())) extraParams.delete(key);
+  }
+  return { searchUrl: `${u.origin}${searchPath}`, origin: u.origin, extraParams };
 }
 
 /** @param {string} s */
@@ -160,8 +166,19 @@ function emptyPageEvidence(htmlText, total) {
     return 'blocked';
   }
   if (total?.exact && total.count === 0) return 'empty';
-  if (!total && /\b(?:no (?:jobs|results) (?:were )?found|no jobs match(?:ing)?\b|there are (?:currently )?no (?:open )?(?:jobs|positions)\b)/i.test(visible)) return 'empty';
+  if (!total && /\b(?:no (?:jobs|results) (?:were )?found|no jobs match(?:ing)?\b|there are (?:currently )?no (?:open )?(?:jobs|positions)\b|no open roles\b)/i.test(visible)) return 'empty';
   return 'unrecognized';
+}
+
+/**
+ * Compatibility guard for callers that need to distinguish a real empty board
+ * from a selector miss. A visible JobDetail link means parsing must not quietly
+ * claim zero jobs.
+ */
+export function assertParsedSomething(html, url) {
+  if (/\/JobDetail\/[^"'\s]+/i.test(String(html ?? ''))) {
+    throw new Error(`avature: ${url} still contains JobDetail links but no article could be parsed — the listing markup changed`);
+  }
 }
 
 /** @type {Provider} */
@@ -193,14 +210,17 @@ export default {
     // non-string/empty override falls back to the default so a malformed entry
     // can't produce `?=N`.
     const pinned = typeof entry.offset_param === 'string' && entry.offset_param.trim();
-    let offsetParam = pinned ? entry.offset_param.trim() : 'jobOffset';
+    let offsetParam = pinned ? entry.offset_param.trim() : PRIMARY_OFFSET_PARAM;
     let canHeal = !pinned; // once the key is pinned, never auto-switch
 
     const jobs = [];
     const seen = new Set();
 
     const getPage = async (param, offset) => {
-      const htmlText = await ctx.fetchText(`${cfg.searchUrl}?${param}=${offset}`, {
+      const query = new URLSearchParams(cfg.extraParams);
+      query.set(param, String(offset));
+      const url = `${cfg.searchUrl}?${query.toString()}`;
+      const htmlText = await ctx.fetchText(url, {
         redirect: 'error',
         headers: { accept: 'text/html' },
       });
@@ -209,7 +229,10 @@ export default {
       if (blocks.length === 0) {
         const evidence = emptyPageEvidence(htmlText, total);
         if (evidence === 'blocked') throw new Error(`avature: blocked or login response for ${entry.name} at offset=${offset}`);
-        if (offset === 0 && evidence !== 'empty') throw new Error(`avature: unrecognized first-page markup for ${entry.name}; no result rows or confirmed no-jobs evidence`);
+        if (offset === 0 && evidence !== 'empty') {
+          assertParsedSomething(htmlText, url);
+          throw new Error(`avature: unrecognized first-page markup for ${entry.name}; no result rows or confirmed no-jobs evidence`);
+        }
       }
       return { articles: parseBlocks(blocks, cfg.origin), rowCount: blocks.length, total };
     };
