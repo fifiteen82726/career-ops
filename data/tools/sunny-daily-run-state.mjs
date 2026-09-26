@@ -2,7 +2,7 @@
 /** Durable controller for one resumable Sunny daily run. */
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { getCareerOpsRoot } from '../../path-resolver.mjs';
 import { acquirePipelineLock } from '../../pipeline-lock.mjs';
 import { isMainModule } from '../../lib/is-main-module.mjs';
@@ -10,7 +10,7 @@ import { canonicalLeadUrl } from './sunny-company-leads.mjs';
 import { refreshScanStatusSnapshot } from './build-sunny-scan-status.mjs';
 
 function file(dataRoot) { return join(dataRoot, 'data/sunny-daily-run-state.json'); }
-function payloadFile(dataRoot, batchId) { return join(dataRoot, 'data', `sunny-daily-payload-${Buffer.from(batchId).toString('base64url')}.json`); }
+function payloadFile(dataRoot, batchId) { return join(dataRoot, 'data', `sunny-daily-payload-${createHash('sha256').update(batchId).digest('hex')}.json`); }
 function canonicalMember(value) {
   const text = String(value || '');
   return /^https?:\/\//i.test(text) ? canonicalLeadUrl(text) : text;

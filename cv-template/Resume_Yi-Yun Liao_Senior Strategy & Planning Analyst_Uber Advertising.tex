@@ -1,0 +1,114 @@
+\documentclass[11pt,letterpaper]{article}
+
+% Font packages for Times Roman
+\usepackage{newtxtext}  % Times Roman font (text)
+\usepackage{newtxmath}  % Times Roman font (math)
+
+% Adjusted margins - slightly smaller
+\usepackage[margin=0.8cm, top=0.8cm, bottom=0.65cm]{geometry}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{ragged2e}  % For justified text
+\usepackage{setspace}  % For tighter line spacing
+
+% Simple formatting
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+
+% Hyperref settings
+\hypersetup{
+    colorlinks=true,
+    urlcolor=black
+}
+
+% Create section with underline directly attached to the text
+\titleformat{\section}{\bfseries\Large}{}{0em}{}
+\titlespacing{\section}{0pt}{2pt}{0pt}
+
+% Better line spacing
+\setstretch{0.96}
+
+\begin{document}
+
+% Header - tighter spacing
+\begin{center}
+  {\Large\textbf{Yi-Yun (Sunny) Liao}}\\[-2pt]
+  (929) 313-3362 $|$ yiyunliao21@gmail.com $|$ linkedin.com/in/yi-yun-liao/
+\end{center}
+
+\vspace{-6pt}  % Less space before first section
+\section*{WORK EXPERIENCE}
+\vspace{-8pt}\noindent\rule{\textwidth}{0.8pt}
+
+\vspace{2pt}
+\noindent{\large\textbf{American Airlines}} \hfill August 2023 -- present\\[-1pt]
+\textit{Senior Data Analyst} \hfill Dallas, Texas
+\begin{itemize}[leftmargin=1.5em, rightmargin=0pt, itemsep=-1pt, topsep=0pt, parsep=0pt]
+  \item \justifying Analyzed \textbf{3TB+} of booking, engagement, and channel-performance data using \textbf{SQL} and \textbf{Python} to identify growth drivers and conversion friction, reducing \textbf{CAC by 7\%}
+  \item \justifying Built centralized performance datasets in \textbf{Azure Databricks} and \textbf{Apache Spark} (\textbf{PySpark}, \textbf{Spark-SQL}) to support recurring business reviews and strategic planning
+  \item \justifying Designed and automated \textbf{15+ Tableau dashboards} and reporting tools for monthly/quarterly review cadences across conversion and channel trends, identifying \textbf{\$1M+} in revenue opportunities
+  \item \justifying Collaborated with sales, operations, product, and finance teams to align KPI definitions and business rules, improving conversion rates by \textbf{3\%} while maintaining profitability targets
+\end{itemize}
+
+\vspace{0.35\baselineskip}  % Reduced space between jobs
+\noindent{\large\textbf{PACCAR}} \hfill Jun 2022 -- Aug 2022\\[-1pt]
+\textit{Data Analyst} \hfill Dallas, Texas
+\begin{itemize}[leftmargin=1.5em, rightmargin=0pt, itemsep=-1pt, topsep=0pt, parsep=0pt]
+  \item \justifying Analyzed \textbf{500M+} records using \textbf{Snowflake SQL} to quantify performance gaps and opportunity areas, informing account and portfolio recommendations that reduced operational costs by \textbf{3\%}
+  \item \justifying Built an automated \textbf{client-facing reporting system} in \textbf{Python} for \textbf{300+} enterprise accounts, improving data accessibility and increasing stakeholder engagement by \textbf{30\%}
+  \item \justifying Developed \textbf{Tableau dashboards} to consolidate operational and client KPIs into recurring business reviews, reducing manual reporting latency by \textbf{17\%}
+\end{itemize}
+
+\vspace{0.35\baselineskip}  % Reduced space between jobs
+\noindent{\large\textbf{Shopee}} (one of the largest e-commerce companies in Asia) \hfill Jul 2021 -- Aug 2021\\[-1pt]
+\textit{Data Analyst} \hfill Taipei, Taiwan
+\begin{itemize}[leftmargin=1.5em, rightmargin=0pt, itemsep=-1pt, topsep=0pt, parsep=0pt]
+  \item \justifying Analyzed \textbf{100M+} ad impression records using \textbf{Python} and \textbf{Presto SQL} to identify advertiser and audience drivers, increasing advertiser conversion by \textbf{9\%}
+  \item \justifying Monitored \textbf{Shopee Ads} performance and click-through trends in \textbf{Power BI}, identifying segment-level opportunities and driving a \textbf{4\%} uplift in ARPU
+  \item \justifying Designed and evaluated \textbf{causal inference} and experiment frameworks with product teams to test monetization and targeting changes, improving 30-day user retention by \textbf{6\%}
+\end{itemize}
+
+\vspace{0.35\baselineskip}  % Reduced space between jobs
+\noindent{\large\textbf{Cathay United Bank}} \hfill Mar 2021 -- Jun 2021\\[-1pt]
+\textit{Data Engineer} \hfill Taipei, Taiwan
+\begin{itemize}[leftmargin=1.5em, rightmargin=0pt, itemsep=-1pt, topsep=0pt, parsep=0pt]
+  \item \justifying Developed face recognition check-in system using \textbf{AWS Rekognition} and \textbf{Amazon Kinesis Video Streams} and designed a user-friendly UI with \textbf{Flask}; reducing \textbf{20\%} of processing time in Scrum
+  \item \justifying Designed an \textbf{ETL} pipeline to store and process \textbf{30K+} check-in images using \textbf{AWS S3} (Object Storage), \textbf{Lambda}, and \textbf{DynamoDB} for metadata storage, enabling scalable and efficient employee record management
+  \item \justifying Applied \textbf{Linear Regression} and \textbf{Gradient Boost} models to predict memory and CPU usage of Java Virtual Machine in an \textbf{Agile} environment; reducing \textbf{10\%} failure rates on the \textbf{Google Cloud Platform}
+\end{itemize}
+
+\vspace{0.35\baselineskip}  % Reduced space between jobs
+\noindent{\large\textbf{Finatext}} \hfill Aug 2020 -- Jan 2021\\[-1pt]
+\textit{Data Analyst} \hfill Taipei, Taiwan
+\begin{itemize}[leftmargin=1.5em, rightmargin=0pt, itemsep=-1pt, topsep=0pt, parsep=0pt]
+  \item \justifying Used \textbf{Python} and \textbf{MySQL} to analyze \textbf{20M+} subway transaction records and visualized in \textbf{Power BI} to derive insights on patterns in passengers' usage of public transportation based on their region of origin
+  \item \justifying Led \textbf{A/B testing} programs on marketing strategies, achieving a \textbf{5\%} increase in subway card usage rate
+\end{itemize}
+
+\vspace{0.5\baselineskip}  % Reduced space before EDUCATION section
+\section*{EDUCATION}
+\vspace{-8pt}\noindent\rule{\textwidth}{0.8pt}
+
+\vspace{2pt}
+\noindent{\large\textbf{New York University}}, Stern \textbar\ Courant \hfill Jan 2021 -- May 2023\\[-1pt]
+Master of Science in Information Systems, GPA: \textbf{3.59} / 4.0 \hfill New York, NY
+
+\vspace{2pt}  % Space between education entries
+\noindent{\large\textbf{Fu Jen Catholic University}} \hfill Sep 2015 -- Jun 2019\\[-1pt]
+Bachelor of Arts in Economics, GPA: \textbf{3.76} / 4.0; Dean's List for 3 semesters \hfill New Taipei City, Taiwan
+
+\vspace{0.5\baselineskip}  % Reduced space before TECHNICAL SKILLS section
+\section*{TECHNICAL SKILLS}
+\vspace{-8pt}\noindent\rule{\textwidth}{0.8pt}
+
+\vspace{2pt}
+\noindent\textbf{Programming \& Databases:} \textbf{SQL} (Snowflake, Presto, Spark-SQL), \textbf{Python} (Pandas, NumPy, PySpark), \textbf{R} (Tidyverse)
+
+\vspace{2pt}
+\noindent\textbf{Strategy \& Analytics:} Strategy \& Planning, Data Governance, KPI Definition, Revenue Strategy, Forecasting, MBR/QBR Reporting, A/B Testing, Experimental Design, Hypothesis Testing, Causal Inference
+
+\vspace{2pt}
+\noindent\textbf{Analysis \& Tools:} Tableau, Power BI, Looker, Databricks, Apache Spark, dbt, Excel, AWS (S3, Lambda), GCP (BigQuery), Git, Azure
+
+\end{document}

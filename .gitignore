@@ -7,6 +7,7 @@ local/
 # means a new generated file (e.g. a future log/cache addition) is covered
 # for every user automatically, with no per-filename .gitignore update needed.
 data/*
+!data/sunny-linkedin-company-aliases.tsv
 !data/.gitkeep
 !data/offers/
 !data/parser-output/

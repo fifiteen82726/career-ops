@@ -113,6 +113,43 @@ test('stores one immutable payload per canonical member and exposes exact unfini
   await assert.rejects(checkpointBatch({ dataRoot, batchId: state.current_batch.id, payloads: { [b]: { ...second, sheet_values: [...second.sheet_values.slice(0, 13), 'changed'] } } }), /immutable/i);
 });
 
+test('uses a bounded payload filename for a five-source deferred batch and resumes every payload ledger', async t => {
+  const dataRoot = root(t);
+  const members = Array.from({ length: 5 }, (_, index) => `source|ordinary-${index}|${'x'.repeat(80)}`);
+  for (const key of members) await recordFailure({ key, queue: 'source', stage: 'scan', message: 'HTTP 503', failed_at: '2026-09-24T00:00:00.000Z' }, { dataRoot, queue: 'source' });
+  const state = await startOrResumeRun({ dataRoot, batch: { type: 'source_retry', members } });
+  const payloads = Object.fromEntries(members.map((key, index) => {
+    const payload = fixturePayload(key, `source-${index}`);
+    payload.operations.scan_summary = { status: 'done', reference: `summary!A${index + 2}` };
+    return [key, payload];
+  }));
+  const outcomes = members.map(key => ({ key, status: 'deferred', evidence: { reason: 'retry scheduled' } }));
+  const checkpointed = await checkpointBatch({ dataRoot, batchId: state.current_batch.id, payloads, outcomes });
+  const filename = checkpointed.current_batch.payload_path.split('/').at(-1);
+  assert.ok(Buffer.byteLength(filename) <= 255);
+  assert.equal(checkpointed.current_batch.id, state.current_batch.id);
+  assert.deepEqual(checkpointed.current_batch.members, members);
+  const resumed = readRunStatus({ dataRoot });
+  assert.deepEqual(Object.keys(resumed.current_batch.payloads).sort(), members.slice().sort());
+  for (const key of members) assert.equal(resumed.current_batch.payloads[key].operations.scan_summary.status, 'done');
+  const replay = await checkpointBatch({ dataRoot, batchId: state.current_batch.id, payloads });
+  assert.equal(replay.current_batch.payload_path, checkpointed.current_batch.payload_path);
+});
+
+test('retains an existing readable compact payload path without migrating or renaming it', async t => {
+  const dataRoot = root(t); const key = 'source|legacy|compact';
+  await recordFailure({ key, queue: 'source', stage: 'scan', message: 'HTTP 503', failed_at: '2026-09-24T00:00:00.000Z' }, { dataRoot, queue: 'source' });
+  const path = join(dataRoot, 'data/sunny-daily-payload-existing.json');
+  const payload = fixturePayload(key, 'legacy');
+  writeFileSync(path, `${JSON.stringify({ schema_version: 2, batch_id: 'legacy-compact-batch', payloads: { [key]: payload } }, null, 2)}\n`);
+  const state = await startOrResumeRun({ dataRoot, batch: { id: 'legacy-compact-batch', type: 'source_retry', members: [key], payload_path: path } });
+  assert.deepEqual(readRunStatus({ dataRoot }).current_batch.payloads[key].sheet_values, payload.sheet_values);
+  const progressed = { ...payload, operations: { ...payload.operations, scan_summary: { status: 'done', reference: 'summary!A2' } } };
+  const checkpointed = await checkpointBatch({ dataRoot, batchId: state.current_batch.id, payload: progressed });
+  assert.equal(checkpointed.current_batch.payload_path, path);
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).payloads[key].sheet_values, payload.sheet_values);
+});
+
 test('requires durable candidate disposition and refuses a fabricated published checkpoint', async t => {
   const dataRoot = root(t); const url = 'https://example.com/a';
   queue(dataRoot, [{ url, status: 'pending' }]);

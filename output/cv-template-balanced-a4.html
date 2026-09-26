@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="{{LANG}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{NAME}} - Resume</title>
+  <style>
+    :root {
+      --ink: #000000;
+      --paper: #ffffff;
+      --body-leading: 1.27;
+      --job-gap: 5px;
+      --section-gap: 7px;
+      --bullet-gap: 1.5px;
+    }
+    @page { size: A4; margin: 0; }
+    * { box-sizing: border-box; }
+    html, body {
+      width: 210mm;
+      min-height: 297mm;
+      margin: 0;
+      padding: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 10.2pt;
+      line-height: var(--body-leading);
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }
+    .page {
+      width: {{PAGE_WIDTH}};
+      min-height: 297mm;
+      padding: 0.55in;
+      background: var(--paper);
+      color: var(--ink);
+    }
+    .header { text-align: center; padding-bottom: 2px; }
+    h1 {
+      margin: 0 0 3px;
+      color: var(--ink);
+      font-size: 22px;
+      line-height: 1.04;
+      letter-spacing: 0.01em;
+      font-weight: 700;
+    }
+    a { color: var(--ink); text-decoration: none; white-space: nowrap; }
+    .contact-row {
+      display: flex;
+      justify-content: center;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: 0 5px;
+      color: var(--ink);
+      font-size: 10pt;
+      line-height: 1.18;
+    }
+    .separator { color: var(--ink); }
+    .section { margin-top: var(--section-gap); }
+    .section-title {
+      margin: 0 0 3px;
+      padding: 0 0 2px;
+      border-bottom: 1px solid var(--ink);
+      color: var(--ink);
+      font-size: 10.8pt;
+      line-height: 1.08;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+    strong { font-weight: 700; }
+    .job {
+      margin: 0 0 var(--job-gap);
+      break-inside: auto;
+      page-break-inside: auto;
+    }
+    .job-header, .edu-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 10px;
+    }
+    .edu-header { display: contents; }
+    .job-company, .edu-title { color: var(--ink); font-weight: 700; }
+    .job-company { font-size: 10.2pt; }
+    .job-period, .edu-year {
+      color: var(--ink);
+      font-size: 10pt;
+      white-space: nowrap;
+    }
+    .job-role, .job-location {
+      display: inline;
+      color: var(--ink);
+      font-size: 10pt;
+      line-height: 1.16;
+    }
+    .job-role { font-style: italic; font-weight: 700; }
+    .job-location::before { content: " | "; }
+    ul { margin: 2px 0 0 15px; padding: 0; }
+    li {
+      margin: 0 0 var(--bullet-gap);
+      padding-left: 1px;
+    }
+    .edu-item {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-rows: auto auto;
+      column-gap: 10px;
+      margin: 0 0 2px;
+      break-inside: avoid;
+      page-break-inside: avoid;
+    }
+    .edu-title {
+      display: flex;
+      flex: 1 1 auto;
+      min-width: 0;
+      flex-direction: column-reverse;
+      grid-column: 1;
+      grid-row: 1 / span 2;
+      color: var(--ink);
+      font-size: 10pt;
+      line-height: 1.17;
+      font-weight: 400;
+    }
+    .edu-org {
+      display: block;
+      color: var(--ink);
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .edu-org::before { content: none; }
+    .edu-year {
+      grid-column: 2;
+      grid-row: 1;
+      align-self: start;
+    }
+    .edu-location {
+      grid-column: 2;
+      grid-row: 2;
+      align-self: end;
+      color: var(--ink);
+      font-size: 10pt;
+      line-height: 1.17;
+      white-space: nowrap;
+    }
+    .skills-grid { margin: 0; }
+    .skill-item {
+      margin: 0 0 1px;
+      color: var(--ink);
+      font-size: 10pt;
+      line-height: 1.24;
+    }
+    .skill-category { color: var(--ink); font-weight: 700; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <h1>{{NAME}}</h1>
+      <div class="contact-row"><span>contact</span></div>
+    </div>
+    <main>
+      <section class="section">
+        <h2 class="section-title">{{SECTION_EXPERIENCE}}</h2>
+        {{EXPERIENCE}}
+      </section>
+      <section class="section">
+        <h2 class="section-title">{{SECTION_EDUCATION}}</h2>
+        {{EDUCATION}}
+      </section>
+      <section class="section">
+        <h2 class="section-title">{{SECTION_SKILLS}}</h2>
+        {{SKILLS}}
+      </section>
+    </main>
+  </div>
+</body>
+</html>
