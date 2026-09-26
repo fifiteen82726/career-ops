@@ -10,6 +10,7 @@ import { canonicalLeadUrl } from './sunny-company-leads.mjs';
 import { refreshScanStatusSnapshot } from './build-sunny-scan-status.mjs';
 
 function file(dataRoot) { return join(dataRoot, 'data/sunny-daily-run-state.json'); }
+function historyFile(dataRoot, runId) { return join(dataRoot, 'data/company-discovery/daily-run-history', `${createHash('sha256').update(runId).digest('hex')}.json`); }
 function payloadFile(dataRoot, batchId) { return join(dataRoot, 'data', `sunny-daily-payload-${createHash('sha256').update(batchId).digest('hex')}.json`); }
 function canonicalMember(value) {
   const text = String(value || '');
@@ -61,12 +62,24 @@ function batchFor(runId, batch) {
   const id = batch.id || `${runId}:${batch.type || 'normal'}:${members.join(',')}`;
   return { id, type: batch.type || 'normal', members, outcomes: [], closeout: null, payload_path: batch.payload_path || null, created_at: new Date().toISOString() };
 }
+function isExceptionBatch(batch) { return ['diagnosis', 'source_retry', 'candidate_retry'].includes(batch?.type); }
+function newDailyState({ day, at, prior, mode = 'daily' }) {
+  const suspended = [...(prior?.suspended_batches || [])];
+  if (isExceptionBatch(prior?.current_batch)) suspended.push(prior.current_batch);
+  return {
+    schema_version: 1, run_id: `${mode}-${day}-${randomUUID()}`, ny_day: day, mode, status: 'running', phase: 'scan', started_at: at,
+    processed: { published: 0, rejected: 0, duplicate: 0, closed: 0, deferred: 0 }, coverage: { status: 'unknown' },
+    current_batch: isExceptionBatch(prior?.current_batch) ? null : prior?.current_batch || null,
+    recent_batches: [], suspended_batches: suspended, prior_run_history: prior ? historyFile('', prior.run_id).split('/').at(-1) : null,
+  };
+}
 export async function startOrResumeRun({ dataRoot = getCareerOpsRoot(), now = new Date(), mode = 'daily', batch, catch_up, lockOptions } = {}) {
   const at = new Date(now).toISOString(); const day = nyDay(now);
   return update(dataRoot, existing => {
     // An open batch is durable work even after the calendar turns over. Resume
     // it rather than creating a competing run or losing its saved payload.
-    const resumable = existing && (existing.current_batch || (existing.ny_day === day && ['running', 'partial', 'failed'].includes(existing.status)));
+    const resumable = existing && (existing.current_batch || (existing.suspended_batches || []).length
+      || (existing.ny_day === day && ['running', 'partial', 'failed', 'complete'].includes(existing.status)));
     const state = resumable ? existing : { schema_version: 1, run_id: `${mode}-${day}-${randomUUID()}`, ny_day: day, mode, status: 'running', phase: 'scan', started_at: at, processed: { published: 0, rejected: 0, duplicate: 0, closed: 0, deferred: 0 }, coverage: { status: 'unknown' }, current_batch: null, recent_batches: [], ...(catch_up ? { catch_up } : {}) };
     if (resumable) state.status = 'running';
     if (!state.current_batch && batch && !(batch.type === 'final_closeout' && state.final_closeout)) {
@@ -84,16 +97,40 @@ export async function startOrResumeRun({ dataRoot = getCareerOpsRoot(), now = ne
 export async function claimDailyScan({ dataRoot = getCareerOpsRoot(), now = new Date(), lockOptions } = {}) {
   const at = new Date(now).toISOString(); const day = nyDay(now);
   return update(dataRoot, existing => {
-    const state = existing && existing.ny_day === day ? existing : {
-      schema_version: 1, run_id: `daily-${day}-${randomUUID()}`, ny_day: day, mode: 'daily', status: 'running', phase: 'scan', started_at: at,
-      processed: { published: 0, rejected: 0, duplicate: 0, closed: 0, deferred: 0 }, coverage: { status: 'unknown' }, current_batch: null, recent_batches: [],
-    };
+    if (existing && existing.ny_day !== day && existing.scan_claim && existing.scan_claim.status !== 'received') {
+      return { ...existing, claimed: false, recovery: true, scan_id: existing.scan_claim.scan_id };
+    }
+    let state = existing && existing.ny_day === day ? existing : null;
+    if (!state) {
+      if (existing) {
+        const path = historyFile(dataRoot, existing.run_id);
+        mkdirSync(join(dataRoot, 'data/company-discovery/daily-run-history'), { recursive: true });
+        writeFileSync(path, `${JSON.stringify(existing, null, 2)}\n`);
+      }
+      state = newDailyState({ day, at, prior: existing });
+    }
     if (state.scan_claim?.ny_day === day) return { ...state, claimed: false, scan_id: state.scan_claim.scan_id };
     const scan_id = `daily-${day}-${randomUUID()}`;
     state.scan_claim = { scan_id, ny_day: day, status: 'claimed', claimed_at: at, receipt: null };
     state.updated_at = at; state.continue_required = true; state.next_action = 'run_claimed_scan';
     return { ...state, claimed: true, scan_id };
-  }, lockOptions).then(state => ({ claimed: state.claimed, scan_id: state.scan_id, state: (() => { delete state.claimed; delete state.scan_id; return state; })() }));
+  }, lockOptions).then(state => ({ claimed: state.claimed, recovery: state.recovery, scan_id: state.scan_id, state: (() => { delete state.claimed; delete state.recovery; delete state.scan_id; return state; })() }));
+}
+export async function suspendCurrentExceptionBatch({ dataRoot = getCareerOpsRoot(), now = new Date(), lockOptions } = {}) {
+  return update(dataRoot, state => {
+    if (!state?.current_batch || !isExceptionBatch(state.current_batch)) return state;
+    state.suspended_batches = [...(state.suspended_batches || []), state.current_batch];
+    state.current_batch = null; state.phase = 'scan'; state.status = 'running'; state.continue_required = true;
+    state.next_action = 'plan_normal_batch'; state.updated_at = new Date(now).toISOString(); return state;
+  }, lockOptions);
+}
+export async function restoreSuspendedBatch({ dataRoot = getCareerOpsRoot(), now = new Date(), lockOptions } = {}) {
+  return update(dataRoot, state => {
+    if (!state || state.current_batch || !(state.suspended_batches || []).length) return state;
+    state.current_batch = state.suspended_batches[0]; state.suspended_batches = state.suspended_batches.slice(1);
+    state.status = 'running'; state.phase = 'exceptions'; state.continue_required = true;
+    state.next_action = 'checkpoint_batch'; state.updated_at = new Date(now).toISOString(); return state;
+  }, lockOptions);
 }
 export async function recordDailyScanReceipt({ dataRoot = getCareerOpsRoot(), scanId, receiptPath, receipt, lockOptions, refreshStatus = refreshScanStatusSnapshot } = {}) {
   if (!scanId) throw new Error('Scan receipt requires the claimed scan ID');
@@ -329,7 +366,7 @@ export async function closeBatch({ dataRoot = getCareerOpsRoot(), batchId, close
     if (batch.type === 'final_closeout') {
       state.final_closeout = { batch_id: batch.id, closed_at: new Date(now).toISOString(), reference: closeout.scan_summary.reference };
       const counts = durableCounts(dataRoot, now);
-      const blocked = counts.normal || counts.due_retries || counts.waiting_retries || counts.unresolved_diagnoses
+      const blocked = counts.normal || counts.due_retries || counts.waiting_retries || counts.unresolved_diagnoses || (state.suspended_batches || []).length
         || (state.scan_claim && state.scan_claim.status !== 'received');
       state.status = blocked ? 'partial' : 'complete';
       state.stop_reason = blocked ? 'durable work or diagnosis remains after closeout' : '';
@@ -344,7 +381,7 @@ export async function closeBatch({ dataRoot = getCareerOpsRoot(), batchId, close
 }
 export async function stopRun({ dataRoot = getCareerOpsRoot(), status, reason = '', lockOptions, refreshStatus = refreshScanStatusSnapshot } = {}) {
   if (!['partial', 'failed', 'complete'].includes(status)) throw new Error('Invalid terminal run status');
-  const result = await update(dataRoot, state => { if (!state) throw new Error('No Sunny run'); const counts = durableCounts(dataRoot); if (status === 'complete' && state.current_batch) throw new Error('Cannot complete with an open batch'); if (status === 'complete' && (counts.normal || counts.due_retries || counts.diagnoses || counts.unresolved_diagnoses)) throw new Error('Cannot complete while durable pending work or unresolved diagnosis remains'); if (status === 'complete' && state.scan_claim && state.scan_claim.status !== 'received') throw new Error('Cannot complete with an unaccounted scan claim'); if (status === 'complete' && !state.final_closeout) throw new Error('Cannot complete before final closeout'); state.status = status; state.stop_reason = reason; state.counts = counts; state.continue_required = status !== 'complete' && Boolean(state.current_batch); state.next_action = status === 'complete' ? 'none' : 'resume_run'; state.updated_at = new Date().toISOString(); return state; }, lockOptions);
+  const result = await update(dataRoot, state => { if (!state) throw new Error('No Sunny run'); const counts = durableCounts(dataRoot); if (status === 'complete' && state.current_batch) throw new Error('Cannot complete with an open batch'); if (status === 'complete' && (state.suspended_batches || []).length) throw new Error('Cannot complete with suspended batches'); if (status === 'complete' && (counts.normal || counts.due_retries || counts.waiting_retries || counts.diagnoses || counts.unresolved_diagnoses)) throw new Error('Cannot complete while durable pending work or unresolved diagnosis remains'); if (status === 'complete' && state.scan_claim && state.scan_claim.status !== 'received') throw new Error('Cannot complete with an unaccounted scan claim'); if (status === 'complete' && !state.final_closeout) throw new Error('Cannot complete before final closeout'); state.status = status; state.stop_reason = reason; state.counts = counts; state.continue_required = status !== 'complete' && Boolean(state.current_batch); state.next_action = status === 'complete' ? 'none' : 'resume_run'; state.updated_at = new Date().toISOString(); return state; }, lockOptions);
   return refreshStatusAfter(result, dataRoot, refreshStatus);
 }
 

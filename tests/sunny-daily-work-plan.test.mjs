@@ -3,13 +3,14 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 
 import { buildDailyWorkPlan } from '../data/tools/run-sunny-daily-work-plan.mjs';
 import { enqueueScanReceipt } from '../data/tools/sunny-job-queue.mjs';
-import { recordFailure } from '../data/tools/sunny-exception-store.mjs';
+import { recordFailure, resolveException } from '../data/tools/sunny-exception-store.mjs';
 import { runSerializedScan } from '../data/tools/run-sunny-serialized-scan.mjs';
 import { acknowledgeException } from '../data/tools/sunny-exception-diagnose.mjs';
-import { closeBatch } from '../data/tools/sunny-daily-run-state.mjs';
+import { checkpointBatch, closeBatch } from '../data/tools/sunny-daily-run-state.mjs';
 
 function root(t) {
   const dataRoot = mkdtempSync(join(tmpdir(), 'sunny-daily-work-plan-'));
@@ -30,6 +31,30 @@ function receipt(url, runId = 'daily-seed') {
       added_urls: [url],
       errors: [],
     },
+  };
+}
+
+function diagnosisPayload(identity) {
+  return {
+    identity,
+    decision: { status: 'closed', reason: 'operator-confirmed' },
+    evidence: { source: 'temporary regression fixture' },
+    source_window: { observed_at: '2026-09-24T16:00:00.000Z', since_days: 3 },
+    sheet_values: Array.from({ length: 14 }, (_, index) => `diagnosis-${index}`),
+    job_values: { url: identity, title: 'diagnosis fixture' },
+    link_values: { url: identity, sheet_ref: 'diagnosis-fixture' },
+    archive_values: { archive_path: 'diagnosis-fixture' },
+    operations: Object.fromEntries(['date_tab', 'master', 'excluded', 'seen_jobs', 'scan_summary', 'archive', 'index', 'queue_disposition']
+      .map(name => [name, { status: 'pending' }])),
+  };
+}
+
+function normalCloseout(url) {
+  return {
+    date_tab: { status: 'not_applicable', reference: 'n/a' }, master: { status: 'not_applicable', reference: 'n/a' },
+    excluded: { status: 'updated', reference: `excluded:${url}` }, seen_jobs: { status: 'updated', reference: `seen:${url}` },
+    scan_summary: { status: 'updated', reference: 'summary!A1' }, archive: { status: 'not_applicable', reference: 'n/a' },
+    index: { status: 'not_applicable', reference: 'n/a' }, queue_disposition: { status: 'updated', reference: `queue:${url}` },
   };
 }
 
@@ -203,6 +228,11 @@ test('new pending work after same-day final closeout reopens the run without res
   assert.equal(reopened.batch.type, 'normal');
   assert.deepEqual(reopened.normal_jobs.map(job => job.url), [url]);
   assert.equal(JSON.parse(readFileSync(join(dataRoot, 'data/sunny-daily-run-state.json'))).final_closeout, undefined);
+
+  const retainedClaim = JSON.parse(readFileSync(join(dataRoot, 'data/sunny-daily-run-state.json'), 'utf8')).scan_claim.scan_id;
+  await buildDailyWorkPlan({ dataRoot, now: new Date('2026-09-24T20:00:00.000Z'), scan });
+  assert.equal(calls, 1);
+  assert.equal(JSON.parse(readFileSync(join(dataRoot, 'data/sunny-daily-run-state.json'), 'utf8')).scan_claim.scan_id, retainedClaim);
 });
 
 test('an acknowledged diagnosis remains a blocker but is never selected for another diagnosis batch', async t => {
@@ -240,6 +270,141 @@ test('a claim without a matching persisted receipt becomes explicit recovery ins
   const plan = await buildDailyWorkPlan({ dataRoot, now: new Date('2026-09-24T17:00:00.000Z'), scan: async () => { throw new Error('must not scan'); } });
   assert.equal(plan.phase, 'recovery');
   assert.equal(plan.next_action, 'recover_scan_receipt');
+});
+
+test('a prior-day diagnosis is suspended for new normal work after exactly one new-day scan', async t => {
+  const dataRoot = root(t); const key = 'source|prior-day|transient';
+  for (const failed_at of ['2026-09-20T00:00:00.000Z', '2026-09-21T00:00:00.000Z', '2026-09-22T00:00:00.000Z']) {
+    await recordFailure({ key, stage: 'scan', message: 'HTTP 503', failed_at }, { dataRoot, queue: 'source' });
+  }
+  const yesterday = await buildDailyWorkPlan({ dataRoot, runScan: false, now: new Date('2026-09-24T16:00:00.000Z') });
+  assert.equal(yesterday.batch.type, 'diagnosis');
+  const sourceBefore = JSON.parse(readFileSync(join(dataRoot, 'data/sunny-scan-exception-queue.json'), 'utf8'));
+  let calls = 0;
+  const scan = async options => {
+    calls += 1;
+    return runSerializedScan({ ...options, routineLease: false, runChild: async () => ({
+      exitCode: 0, stdout: JSON.stringify({ version: 'careerops.scan.receipt@1', added_urls: ['https://example.com/jobs/today'], errors: [] }), stderr: '',
+    }) });
+  };
+  const today = await buildDailyWorkPlan({ dataRoot, now: new Date('2026-09-25T16:00:00.000Z'), scan });
+  assert.equal(calls, 1);
+  assert.equal(today.phase, 'normal');
+  assert.equal(today.batch.type, 'normal');
+  assert.deepEqual(today.normal_jobs.map(job => job.url), ['https://example.com/jobs/today']);
+  const state = JSON.parse(readFileSync(join(dataRoot, 'data/sunny-daily-run-state.json'), 'utf8'));
+  assert.equal(state.suspended_batches[0].id, yesterday.batch.id);
+  assert.deepEqual(state.suspended_batches[0].members, [key]);
+  assert.deepEqual(JSON.parse(readFileSync(join(dataRoot, 'data/sunny-scan-exception-queue.json'), 'utf8')), sourceBefore);
+});
+
+test('overnight normal continuation preserves a suspended diagnosis and its saved evidence', async t => {
+  const dataRoot = root(t); const key = 'source|overnight-diagnosis|transient';
+  for (const failed_at of ['2026-09-20T00:00:00.000Z', '2026-09-21T00:00:00.000Z', '2026-09-22T00:00:00.000Z']) {
+    await recordFailure({ key, stage: 'scan', message: 'HTTP 503', failed_at }, { dataRoot, queue: 'source' });
+  }
+  const diagnosis = await buildDailyWorkPlan({ dataRoot, runScan: false, now: new Date('2026-09-24T16:00:00.000Z') });
+  await resolveException({ dataRoot, key, queue: 'source', evidence: { resolution: 'operator-confirmed' } });
+  const savedPayload = diagnosisPayload(key);
+  const saved = await checkpointBatch({ dataRoot, batchId: diagnosis.batch.id, payload: savedPayload,
+    outcomes: [{ key, status: 'closed', evidence: { resolution: 'operator-confirmed' } }] });
+  const payloadBytes = readFileSync(saved.current_batch.payload_path, 'utf8');
+  const exceptionBefore = readFileSync(join(dataRoot, 'data/sunny-scan-exception-queue.json'), 'utf8');
+  let scans = 0;
+  const scan = async options => {
+    scans += 1;
+    return runSerializedScan({ ...options, routineLease: false, runChild: async () => ({
+      exitCode: 0,
+      stdout: JSON.stringify({ version: 'careerops.scan.receipt@1', added_urls: ['https://example.com/jobs/one', 'https://example.com/jobs/two'], errors: [] }),
+      stderr: '',
+    }) });
+  };
+  const first = await buildDailyWorkPlan({ dataRoot, now: new Date('2026-09-25T03:55:00.000Z'), normalLimit: 1, scan });
+  assert.equal(first.batch.type, 'normal');
+  assert.equal(scans, 1);
+  const claimedState = JSON.parse(readFileSync(join(dataRoot, 'data/sunny-daily-run-state.json'), 'utf8'));
+  const queuePath = join(dataRoot, 'data/sunny-job-queue.json');
+  const firstQueue = JSON.parse(readFileSync(queuePath, 'utf8'));
+  firstQueue.jobs.find(job => job.url === first.batch.members[0]).status = 'rejected';
+  writeFileSync(queuePath, JSON.stringify(firstQueue));
+  await checkpointBatch({ dataRoot, batchId: first.batch.id,
+    outcomes: [{ key: first.batch.members[0], status: 'rejected', evidence: { reason: 'fixture rejection' } }] });
+  await closeBatch({ dataRoot, batchId: first.batch.id, closeout: normalCloseout(first.batch.members[0]), now: '2026-09-25T03:58:00.000Z' });
+
+  const second = await buildDailyWorkPlan({ dataRoot, now: new Date('2026-09-25T04:05:00.000Z'), runScan: false, normalLimit: 1, scan });
+  assert.equal(second.batch.type, 'normal');
+  assert.equal(scans, 1);
+  const secondQueue = JSON.parse(readFileSync(queuePath, 'utf8'));
+  secondQueue.jobs.find(job => job.url === second.batch.members[0]).status = 'rejected';
+  writeFileSync(queuePath, JSON.stringify(secondQueue));
+  await checkpointBatch({ dataRoot, batchId: second.batch.id,
+    outcomes: [{ key: second.batch.members[0], status: 'rejected', evidence: { reason: 'fixture rejection' } }] });
+  await closeBatch({ dataRoot, batchId: second.batch.id, closeout: normalCloseout(second.batch.members[0]), now: '2026-09-25T04:08:00.000Z' });
+
+  const restored = await buildDailyWorkPlan({ dataRoot, now: new Date('2026-09-25T04:10:00.000Z'), runScan: false, scan });
+  const restoredState = JSON.parse(readFileSync(join(dataRoot, 'data/sunny-daily-run-state.json'), 'utf8'));
+  assert.equal(restored.run_id, diagnosis.run_id);
+  assert.equal(restoredState.ny_day, claimedState.ny_day);
+  assert.deepEqual(restoredState.scan_claim, claimedState.scan_claim);
+  assert.equal(restoredState.prior_run_history, claimedState.prior_run_history);
+  assert.equal(restored.batch.id, diagnosis.batch.id);
+  assert.deepEqual(restored.batch.members, [key]);
+  assert.deepEqual(restored.batch.outcomes, saved.current_batch.outcomes);
+  assert.equal(restored.batch.payload_path, saved.current_batch.payload_path);
+  assert.equal(readFileSync(restored.batch.payload_path, 'utf8'), payloadBytes);
+  assert.equal(scans, 1);
+  assert.equal(readFileSync(join(dataRoot, 'data/sunny-scan-exception-queue.json'), 'utf8'), exceptionBefore);
+});
+
+test('a previous-day missing scan claim stays recoverable and does not launch today’s scanner', async t => {
+  const dataRoot = root(t);
+  const { claimDailyScan, readRunStatus } = await import('../data/tools/sunny-daily-run-state.mjs');
+  const prior = await claimDailyScan({ dataRoot, now: '2026-09-24T16:00:00.000Z' });
+  let calls = 0;
+  const plan = await buildDailyWorkPlan({ dataRoot, now: new Date('2026-09-25T16:00:00.000Z'), scan: async () => { calls += 1; throw new Error('must not scan'); } });
+  assert.equal(calls, 0);
+  assert.equal(plan.phase, 'recovery');
+  assert.equal(readRunStatus({ dataRoot }).scan_claim.scan_id, prior.scan_id);
+  assert.equal(readRunStatus({ dataRoot }).ny_day, '2026-09-24');
+});
+
+test('a prior received receipt is adopted before exactly one new-day scan', async t => {
+  const dataRoot = root(t);
+  const { claimDailyScan } = await import('../data/tools/sunny-daily-run-state.mjs');
+  const prior = await claimDailyScan({ dataRoot, now: new Date('2026-09-24T16:00:00.000Z') });
+  const receiptDir = join(dataRoot, 'data/company-discovery/receipts'); mkdirSync(receiptDir, { recursive: true });
+  writeFileSync(join(receiptDir, `${prior.scan_id}.json`), JSON.stringify({ run_id: prior.scan_id, kind: 'daily', started_at: '2026-09-24T16:00:00.000Z', since_days: 3, dry_run: false,
+    scan_receipt: { version: 'careerops.scan.receipt@1', added_urls: ['https://example.com/jobs/yesterday'], errors: [] } }));
+  let calls = 0;
+  const scan = async options => { calls += 1; return runSerializedScan({ ...options, routineLease: false, runChild: async () => ({
+    exitCode: 0, stdout: JSON.stringify({ version: 'careerops.scan.receipt@1', added_urls: ['https://example.com/jobs/today'], errors: [] }), stderr: '',
+  }) }); };
+  const plan = await buildDailyWorkPlan({ dataRoot, now: new Date('2026-09-25T16:00:00.000Z'), scan });
+  assert.equal(calls, 1);
+  assert.equal(plan.scan.run_id.startsWith('daily-2026-09-25-'), true);
+  assert.deepEqual(plan.normal_jobs.map(job => job.url).sort(), ['https://example.com/jobs/today', 'https://example.com/jobs/yesterday']);
+  const history = JSON.parse(readFileSync(join(dataRoot, 'data/company-discovery/daily-run-history', `${createHash('sha256').update(prior.state.run_id).digest('hex')}.json`), 'utf8'));
+  assert.equal(history.scan_claim.status, 'received');
+});
+
+test('a final closeout on the previous New York day does not suppress today’s scan', async t => {
+  const dataRoot = root(t); let calls = 0;
+  const scan = async options => {
+    calls += 1;
+    return runSerializedScan({ ...options, routineLease: false, runChild: async () => ({
+      exitCode: 0, stdout: JSON.stringify({ version: 'careerops.scan.receipt@1', added_urls: [], errors: [] }), stderr: '',
+    }) });
+  };
+  const first = await buildDailyWorkPlan({ dataRoot, now: new Date('2026-09-24T16:00:00.000Z'), scan });
+  await closeBatch({ dataRoot, batchId: first.batch.id, closeout: {
+    date_tab: { status: 'not_applicable', reference: 'n/a' }, master: { status: 'not_applicable', reference: 'n/a' },
+    excluded: { status: 'not_applicable', reference: 'n/a' }, seen_jobs: { status: 'not_applicable', reference: 'n/a' },
+    scan_summary: { status: 'updated', reference: 'summary!A1' }, archive: { status: 'not_applicable', reference: 'n/a' },
+    index: { status: 'not_applicable', reference: 'n/a' }, queue_disposition: { status: 'not_applicable', reference: 'n/a' },
+  } });
+  const today = await buildDailyWorkPlan({ dataRoot, now: new Date('2026-09-25T16:00:00.000Z'), scan });
+  assert.equal(calls, 2);
+  assert.equal(today.scan.run_id.startsWith('daily-2026-09-25-'), true);
 });
 
 test('invalid catch-up receipt leaves durable state untouched', async t => {

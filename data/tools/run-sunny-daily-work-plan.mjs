@@ -7,7 +7,7 @@ import { isMainModule } from '../../lib/is-main-module.mjs';
 import { readExceptionQueue } from './sunny-exception-store.mjs';
 import { enqueueScanReceipt, readPendingJobs, reconcileScanReceipts } from './sunny-job-queue.mjs';
 import { runSerializedScan } from './run-sunny-serialized-scan.mjs';
-import { readRunStatus, startOrResumeRun, claimDailyScan, recordDailyScanReceipt, markMissingScanReceipt, markRunPartial } from './sunny-daily-run-state.mjs';
+import { readRunStatus, startOrResumeRun, claimDailyScan, recordDailyScanReceipt, markMissingScanReceipt, markRunPartial, suspendCurrentExceptionBatch, restoreSuspendedBatch } from './sunny-daily-run-state.mjs';
 import { ingestScanReceiptExceptions } from './sunny-scan-exception-queue.mjs';
 
 function compareExceptions(left, right) {
@@ -72,6 +72,7 @@ function allRetryableExceptions(dataRoot) {
   return ['candidate', 'source'].flatMap(queue => readExceptionQueue({ dataRoot, queue }))
     .filter(item => item.status === 'retryable').sort(compareExceptions);
 }
+function newYorkDay(now) { return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date(now)); }
 
 /**
  * Reconcile durable scan receipts, run at most one new daily scan, and select
@@ -92,35 +93,6 @@ export async function buildDailyWorkPlan({
   if (catchUp && runScan) throw new Error('Catch-up requires --no-scan');
   if (catchUp && !retryCurrentOnce) throw new Error('Catch-up requires --retry-current-once');
   const catchUpReceipt = catchUp ? validatedCatchUpReceipt(scanReceipt) : null;
-  // An immutable batch (including an interrupted closeout) is authoritative:
-  // never rescan or select a newer job until it has been checkpointed/closed.
-  const existing = readRunStatus({ dataRoot, now });
-  if (existing.current_batch) {
-    const batch = existing.current_batch;
-    const pending = readPendingJobs({ dataRoot });
-    return {
-      phase: batch.type === 'normal' || batch.type === 'candidate_retry' ? 'normal' : 'exceptions',
-      normal_jobs: batch.type === 'normal' ? pending.filter(job => batch.members.includes(job.url)) : [],
-      exception_jobs: batch.type === 'normal' ? [] : batch.members.map(key => ({ key })),
-      diagnoses_due: diagnosisExceptions(dataRoot), reconciliation: { resumed_batch: true }, scan: null,
-      run_id: existing.run_id, run_status: existing.status, continue_required: true,
-      next_action: existing.next_action, batch,
-      status_counts: existing.counts,
-      checkpoint_command: 'node data/tools/sunny-daily-run-state.mjs checkpoint --input FILE',
-      close_command: 'node data/tools/sunny-daily-run-state.mjs close --receipt FILE',
-      ...(existing.catch_up ? { receipt_provenance: existing.catch_up.receipt_provenance } : {}),
-    };
-  }
-  const workAfterCloseout = existing.counts.normal_pending > 0
-    || existing.counts.due_retries > 0
-    || existing.counts.diagnoses_unacknowledged > 0;
-  if (existing.final_closeout && !workAfterCloseout) {
-    return {
-      phase: 'terminal', terminal: true, batch: null, normal_jobs: [], exception_jobs: [], diagnoses_due: [], scan: null,
-      reconciliation: { terminal: true }, run_id: existing.run_id, run_status: existing.status,
-      continue_required: existing.continue_required, next_action: existing.next_action, status_counts: existing.counts,
-    };
-  }
   const reconciliation = await reconcileScanReceipts({ dataRoot });
   // A supplied catch-up receipt is ingested only after its complete provenance
   // validates. Receipt replay is idempotent in both queues.
@@ -132,7 +104,20 @@ export async function buildDailyWorkPlan({
   if (runScan) {
     // Claim first, then launch exactly that identity. A second invocation sees
     // the persisted claim and plans recovery instead of silently rescanning.
-    const claim = await claimDailyScan({ dataRoot, now });
+    let claim = await claimDailyScan({ dataRoot, now });
+    if (claim.recovery) {
+      const adopted = await adoptPersistedDailyReceipt({ dataRoot, claim });
+      if (!adopted) {
+        const state = await markMissingScanReceipt({ dataRoot, scanId: claim.scan_id });
+        return { phase: 'recovery', batch: null, normal_jobs: [], exception_jobs: [], diagnoses_due: diagnosisExceptions(dataRoot),
+          reconciliation, scan: { skipped: 'missing_prior_claim_receipt', run_id: claim.scan_id }, run_id: state.run_id, run_status: state.status,
+          continue_required: true, next_action: state.next_action, status_counts: readRunStatus({ dataRoot, now }).counts };
+      }
+      // Account for the old claim before turning over to today's identity. The
+      // persisted receipt is evidence of an already-run scan, never a reason
+      // to rerun it.
+      claim = await claimDailyScan({ dataRoot, now });
+    }
     if (claim.claimed) {
       scanResult = await scan({ kind: 'daily', dataRoot, since, now, runId: claim.scan_id });
       await recordDailyScanReceipt({ dataRoot, scanId: claim.scan_id, receiptPath: scanResult.receipt_path, receipt: scanResult });
@@ -145,6 +130,39 @@ export async function buildDailyWorkPlan({
           continue_required: true, next_action: state.next_action, status_counts: readRunStatus({ dataRoot, now }).counts };
       }
     }
+  }
+  let existing = readRunStatus({ dataRoot, now });
+  const pendingBeforeResume = readPendingJobs({ dataRoot });
+  if (existing.current_batch && ['diagnosis', 'source_retry', 'candidate_retry'].includes(existing.current_batch.type) && pendingBeforeResume.length) {
+    await suspendCurrentExceptionBatch({ dataRoot, now });
+    existing = readRunStatus({ dataRoot, now });
+  }
+  if (existing.current_batch) {
+    const batch = existing.current_batch;
+    const pending = readPendingJobs({ dataRoot });
+    return {
+      phase: batch.type === 'normal' || batch.type === 'candidate_retry' ? 'normal' : 'exceptions',
+      normal_jobs: batch.type === 'normal' ? pending.filter(job => batch.members.includes(job.url)) : [],
+      exception_jobs: batch.type === 'normal' ? [] : batch.members.map(key => ({ key })),
+      diagnoses_due: diagnosisExceptions(dataRoot), reconciliation: { ...reconciliation, resumed_batch: true }, scan: scanResult,
+      run_id: existing.run_id, run_status: existing.status, continue_required: true,
+      next_action: existing.next_action, batch,
+      status_counts: existing.counts,
+      checkpoint_command: 'node data/tools/sunny-daily-run-state.mjs checkpoint --input FILE',
+      close_command: 'node data/tools/sunny-daily-run-state.mjs close --receipt FILE',
+      ...(existing.catch_up ? { receipt_provenance: existing.catch_up.receipt_provenance } : {}),
+    };
+  }
+  const workAfterCloseout = existing.counts.normal_pending > 0
+    || existing.counts.due_retries > 0
+    || existing.counts.diagnoses_unacknowledged > 0
+    || (existing.suspended_batches || []).length > 0;
+  if (existing.final_closeout && existing.ny_day === newYorkDay(now) && !workAfterCloseout) {
+    return {
+      phase: 'terminal', terminal: true, batch: null, normal_jobs: [], exception_jobs: [], diagnoses_due: [], scan: scanResult,
+      reconciliation: { ...reconciliation, terminal: true }, run_id: existing.run_id, run_status: existing.status,
+      continue_required: existing.continue_required, next_action: existing.next_action, status_counts: existing.counts,
+    };
   }
   const pendingJobs = readPendingJobs({ dataRoot });
   const normalJobs = pendingJobs.slice(0, normalLimit);
@@ -173,6 +191,19 @@ export async function buildDailyWorkPlan({
       next_action: state.next_action, batch: current,
       status_counts: readRunStatus({ dataRoot, now }).counts,
       checkpoint_command: current ? `node data/tools/sunny-daily-run-state.mjs checkpoint --input FILE` : '',
+    };
+  }
+
+  if ((existing.suspended_batches || []).length) {
+    const state = await restoreSuspendedBatch({ dataRoot, now });
+    const batch = state.current_batch;
+    return {
+      phase: batch.type === 'normal' || batch.type === 'candidate_retry' ? 'normal' : 'exceptions', normal_jobs: [],
+      exception_jobs: batch.members.map(key => ({ key })), diagnoses_due: diagnosisExceptions(dataRoot), reconciliation, scan: scanResult,
+      run_id: state.run_id, run_status: state.status, continue_required: true, next_action: state.next_action, batch,
+      status_counts: readRunStatus({ dataRoot, now }).counts,
+      checkpoint_command: 'node data/tools/sunny-daily-run-state.mjs checkpoint --input FILE',
+      close_command: 'node data/tools/sunny-daily-run-state.mjs close --receipt FILE',
     };
   }
 

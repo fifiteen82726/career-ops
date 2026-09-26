@@ -48,6 +48,18 @@ test('complete is derived from durable queues and pending outcomes cannot be clo
   await assert.rejects(stopRun({ dataRoot, status: 'complete' }), /open batch|pending/i);
 });
 
+test('complete rejects a future retry and preserves the partial closeout state', async t => {
+  const dataRoot = root(t);
+  await recordFailure({ key: 'source|future|transient', stage: 'scan', message: 'HTTP 429', failed_at: '2030-01-01T00:00:00.000Z' }, { dataRoot, queue: 'source' });
+  const state = await startOrResumeRun({ dataRoot, batch: { type: 'final_closeout', members: [] } });
+  await closeBatch({ dataRoot, batchId: state.current_batch.id, closeout: closeout() });
+  const before = readFileSync(join(dataRoot, 'data/sunny-daily-run-state.json'), 'utf8');
+  await assert.rejects(stopRun({ dataRoot, status: 'complete' }), /pending work|unresolved diagnosis/i);
+  assert.equal(readFileSync(join(dataRoot, 'data/sunny-daily-run-state.json'), 'utf8'), before);
+  assert.equal(readRunStatus({ dataRoot }).status, 'partial');
+  assert.equal(readRunStatus({ dataRoot }).counts.waiting_retries, 1);
+});
+
 test('status marks stale running state and reports next action', async t => {
   const dataRoot = root(t);
   await startOrResumeRun({ dataRoot, now: '2026-09-24T00:00:00.000Z' });
@@ -64,6 +76,17 @@ test('persists a daily scan claim before launch and does not claim twice on the 
   assert.equal(second.claimed, false);
   assert.equal(second.scan_id, first.scan_id);
   assert.equal(readRunStatus({ dataRoot }).scan_claim.status, 'claimed');
+});
+
+test('daily scan ownership turns over at the New York midnight boundary rather than UTC midnight', async t => {
+  const dataRoot = root(t);
+  const beforeMidnight = await claimDailyScan({ dataRoot, now: '2026-09-25T03:59:00.000Z' });
+  await recordDailyScanReceipt({ dataRoot, scanId: beforeMidnight.scan_id, receipt: { run_id: beforeMidnight.scan_id, kind: 'daily', dry_run: false, scan_receipt: { version: 'careerops.scan.receipt@1', added_urls: [] } } });
+  const afterMidnight = await claimDailyScan({ dataRoot, now: '2026-09-25T04:01:00.000Z' });
+  assert.equal(beforeMidnight.state.ny_day, '2026-09-24');
+  assert.equal(afterMidnight.claimed, true);
+  assert.notEqual(afterMidnight.scan_id, beforeMidnight.scan_id);
+  assert.equal(afterMidnight.state.ny_day, '2026-09-25');
 });
 
 test('closeout rejects invented not-applicable sinks for a rejected candidate', async t => {
@@ -221,6 +244,22 @@ test('a failed cross-day run resumes its open batch and operation payload as run
   assert.equal(resumed.status, 'running');
   assert.equal(resumed.current_batch.id, first.current_batch.id);
   assert.equal(readRunStatus({ dataRoot, now: '2026-09-25T05:00:00.000Z' }).current_batch.payloads[url].operations.scan_summary.reference, 'summary!A2');
+});
+
+test('daily rollover suspends an exception batch without changing its payload bytes', async t => {
+  const dataRoot = root(t); const key = 'source|rollover|transient';
+  await recordFailure({ key, stage: 'scan', message: 'HTTP 503', failed_at: '2026-09-24T00:00:00.000Z' }, { dataRoot, queue: 'source' });
+  const first = await startOrResumeRun({ dataRoot, now: '2026-09-24T16:00:00.000Z', batch: { type: 'source_retry', members: [key] } });
+  const payload = fixturePayload(key); payload.operations.scan_summary = { status: 'done', reference: 'summary!A2' };
+  const checkpointed = await checkpointBatch({ dataRoot, batchId: first.current_batch.id, payload });
+  const before = readFileSync(checkpointed.current_batch.payload_path, 'utf8');
+  const claimed = await claimDailyScan({ dataRoot, now: '2026-09-25T16:00:00.000Z' });
+  const state = readRunStatus({ dataRoot, now: '2026-09-25T16:00:00.000Z' });
+  assert.equal(claimed.claimed, true);
+  assert.equal(state.current_batch, null);
+  assert.equal(state.suspended_batches[0].id, first.current_batch.id);
+  assert.equal(state.suspended_batches[0].payload_path, checkpointed.current_batch.payload_path);
+  assert.equal(readFileSync(checkpointed.current_batch.payload_path, 'utf8'), before);
 });
 
 test('status counts retries against the supplied clock rather than wall time', async t => {
