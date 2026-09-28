@@ -43,6 +43,17 @@ test('tracked boards and failed owner records are excluded before live-job probi
   assert.deepEqual(rows, []);
 });
 
+test('explicit permission failures do not create a seven-day negative owner cache entry', async () => {
+  const now = new Date('2026-09-10T00:00:00Z');
+  const result = await fetchOwnerRecord('greenhouse', 'acme', {
+    fetchJson: async () => { throw new Error('network access disabled by execution permission'); },
+    fetchText: async () => '',
+  }, now);
+  assert.equal(result.status, 'environment_unavailable');
+  assert.equal(result.environment_only, true);
+  assert.equal(ownerRecordNeedsRefresh(result, new Date('2026-09-10T00:00:01Z')), true);
+});
+
 test('board coordinates use only exact supported public ATS hosts', () => {
   assert.deepEqual(boardCoordinates('greenhouse', 'acme'), {
     careersUrl: 'https://job-boards.greenhouse.io/acme',

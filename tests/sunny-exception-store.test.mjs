@@ -21,11 +21,13 @@ function root(t) {
   return dataRoot;
 }
 
-test('classifies an official candidate 404 as closed', () => {
+test('closes only an authoritative official candidate expiry', () => {
   assert.deepEqual(classifyFailure({
     queue: 'candidate',
     message: 'HTTP 404 job no longer available',
+    evidence: { authoritative_expiry: true, official_url: 'https://jobs.example/42', source_code: 'greenhouse_api_gone' },
   }), { action: 'closed' });
+  assert.deepEqual(classifyFailure({ queue: 'candidate', message: 'wrapper fetch HTTP 404' }), { action: 'retryable' });
 });
 
 test('classifies a source HTTP 429 as retryable', () => {
@@ -114,7 +116,7 @@ test('does not reopen a closed candidate when replaying an older failure', async
   const dataRoot = root(t);
   const base = { key: 'candidate|jd|https://example.com/jobs/3', stage: 'jd' };
   await recordFailure({ ...base, message: 'HTTP 503', failed_at: '2026-09-01T12:00:00.000Z' }, { dataRoot, queue: 'candidate' });
-  await recordFailure({ ...base, message: 'HTTP 404 job no longer available', failed_at: '2026-09-02T12:00:00.000Z' }, { dataRoot, queue: 'candidate' });
+  await recordFailure({ ...base, message: 'HTTP 404 job no longer available', evidence: { authoritative_expiry: true, official_url: 'https://jobs.example/3', source_code: 'greenhouse_api_gone' }, failed_at: '2026-09-02T12:00:00.000Z' }, { dataRoot, queue: 'candidate' });
   const replay = await recordFailure({ ...base, message: 'HTTP 503', failed_at: '2026-09-01T12:00:00.000Z' }, { dataRoot, queue: 'candidate' });
 
   assert.equal(replay.attempt_count, 2);
@@ -202,4 +204,24 @@ test('source identity migration derives every malformed coverage key from stored
   ] }));
   await reconcileExceptionIdentities({ dataRoot });
   assert.equal(readExceptionQueue({ dataRoot, queue: 'source' })[0].key, 'source|costcowholesalecorporation|coverage');
+});
+
+test('source identity reconciliation preserves distinct v2 board windows', async t => {
+  const dataRoot = root(t);
+  writeFileSync(join(dataRoot, 'data/sunny-scan-exception-queue.json'), JSON.stringify({ schema_version: 1, items: [
+    { key: 'source-v2|workday|tenant%7CExternal|2026-09-20|2026-09-23|transient', status: 'retryable', first_failed_at: '2026-09-23T00:00:00.000Z', last_failed_at: '2026-09-23T00:00:00.000Z', attempt_count: 1, attempt_ids: ['a'] },
+    { key: 'source-v2|workday|tenant%7CExternal|2026-09-24|2026-09-27|transient', status: 'retryable', first_failed_at: '2026-09-27T00:00:00.000Z', last_failed_at: '2026-09-27T00:00:00.000Z', attempt_count: 1, attempt_ids: ['b'] },
+  ] }));
+  await reconcileExceptionIdentities({ dataRoot });
+  assert.deepEqual(readExceptionQueue({ dataRoot, queue: 'source' }).map(item => item.key).sort(), [
+    'source-v2|workday|tenant%7CExternal|2026-09-20|2026-09-23|transient',
+    'source-v2|workday|tenant%7CExternal|2026-09-24|2026-09-27|transient',
+  ]);
+});
+
+test('numeric Retry-After is frozen at the originating failure time', async t => {
+  const dataRoot = root(t);
+  await recordFailure({ key: 'source-v2|workday|tenant%7CExternal|2026-09-20|2026-09-23|transient', queue: 'source', stage: 'scan',
+    message: 'HTTP 429', attempt_at: '2026-09-20T19:00:00.000Z', evidence: { retry_after: '3600' } }, { dataRoot, queue: 'source' });
+  assert.equal(readExceptionQueue({ dataRoot, queue: 'source' })[0].next_retry_at, '2026-09-20T20:00:00.000Z');
 });

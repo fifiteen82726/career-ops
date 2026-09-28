@@ -52,6 +52,7 @@ import { resolveAtsApi, JD_TEXT_API_ATS } from './liveness-api.mjs';
 import { decodeEntities } from './providers/_html-entities.mjs';
 import { isWorkModelOnly } from './providers/greenhouse.mjs';
 import { DEFAULT_USER_AGENT } from './user-agent.mjs';
+import { extractDescription } from './providers/smartrecruiters.mjs';
 import { flagValue, hasFlag, validateFlags } from './lib/cli-flags.mjs';
 import { isMainModule } from './lib/is-main-module.mjs';
 
@@ -545,6 +546,158 @@ async function fetchLeverJd(apiUrl, postingUrl, textCap, timeoutMs) {
   }
 }
 
+/** Normalize SmartRecruiters' official posting-detail response. */
+export function normalizeSmartRecruitersJob(json, postingUrl, textCap = JD_TEXT_CAP) {
+  const body = extractDescription(json);
+  if (!body) return null;
+  const str = value => typeof value === 'string' && value.trim() ? value.trim() : '';
+  const location = json?.location?.fullLocation || [json?.location?.city, json?.location?.region, json?.location?.country].filter(Boolean).join(', ');
+  const meta = [location ? `Location: ${location}` : '', str(json?.id) ? `Posting ID: ${str(json.id)}` : ''].filter(Boolean);
+  return { url: postingUrl, title: compactText(str(json?.name), 300), text: compactText([meta.join('\n'), body].filter(Boolean).join('\n\n'), textCap) };
+}
+
+/** Extract a substantive schema.org JobPosting from an official iCIMS detail page. */
+export function normalizeIcimsJobPosting(html, postingUrl, textCap = JD_TEXT_CAP) {
+  const candidates = [];
+  for (const match of String(html || '').matchAll(/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+    try {
+      const data = JSON.parse(match[1]);
+      const nodes = Array.isArray(data) ? data : Array.isArray(data?.['@graph']) ? data['@graph'] : [data];
+      candidates.push(...nodes);
+    } catch { /* malformed JSON-LD is not a JD */ }
+  }
+  const job = candidates.find(node => node && typeof node === 'object' && (node['@type'] === 'JobPosting' || (Array.isArray(node['@type']) && node['@type'].includes('JobPosting'))));
+  const body = jdHtmlToText(job?.description || '');
+  if (!body) return null;
+  const location = job?.jobLocation?.address;
+  const place = [location?.addressLocality, location?.addressRegion, location?.addressCountry].filter(value => typeof value === 'string' && value.trim()).join(', ');
+  return { url: postingUrl, title: compactText(job?.title || '', 300), text: compactText([place ? `Location: ${place}` : '', body].filter(Boolean).join('\n\n'), textCap) };
+}
+
+/**
+ * Read a substantive JobPosting JSON-LD record from a pinned official detail
+ * page.  This intentionally rejects login/consent/search shells: a title-like
+ * heading without a JobPosting description is not a candidate JD.
+ */
+export function normalizeOfficialHtmlJobPosting(html, postingUrl, textCap = JD_TEXT_CAP) {
+  const candidates = [];
+  for (const match of String(html || '').matchAll(/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+    try {
+      const data = JSON.parse(match[1]);
+      candidates.push(...(Array.isArray(data) ? data : Array.isArray(data?.['@graph']) ? data['@graph'] : [data]));
+    } catch { /* malformed structured data is an inconclusive page */ }
+  }
+  const job = candidates.find(node => node && typeof node === 'object'
+    && (node['@type'] === 'JobPosting' || (Array.isArray(node['@type']) && node['@type'].includes('JobPosting'))));
+  let body = jdHtmlToText(job?.description || '');
+  let title = typeof job?.title === 'string' ? job.title : '';
+  let date = typeof job?.datePosted === 'string' && !Number.isNaN(Date.parse(job.datePosted)) ? `Posted: ${job.datePosted}` : '';
+  // EY uses schema.org microdata and Paylocity publishes its description as
+  // labelled rendered HTML, not JSON-LD.  Read only their actual job-detail
+  // regions; consent and navigation copy never qualifies as a description.
+  if (!body) {
+    const source = String(html || '');
+    const micro = source.match(/itemprop=["']description["'][^>]*>([\s\S]*?)<\/span>\s*<\/span>/i);
+    // Paylocity splits the official detail into consecutive labelled regions.
+    // Stop each region at the next header, then retain only the two JD-bearing
+    // labels so Benefits/navigation text cannot leak into the capture.
+    const labelledSections = [...source.matchAll(/<div\b[^>]*class=["'][^"']*job-listing-header[^"']*["'][^>]*>\s*([^<]+?)\s*<\/div>\s*<div[^>]*>([\s\S]*?)(?=<div\b[^>]*class=["'][^"']*job-listing-header|$)/gi)]
+      .filter(match => /^(?:description|requirements)$/i.test(match[1].trim()))
+      .map(match => jdHtmlToText(match[2]))
+      .filter(Boolean);
+    body = jdHtmlToText(micro?.[1] || '') || labelledSections.join('\n\n');
+    title ||= (source.match(/<meta\b[^>]*(?:property|name)=["']og:title["'][^>]*content=["']([^"']+)/i)
+      || source.match(/itemprop=["']title["'][^>]*>([^<]+)/i))?.[1] || '';
+    const posted = source.match(/itemprop=["']datePosted["'][^>]*content=["']([^"']+)/i)?.[1];
+    date ||= posted && !Number.isNaN(Date.parse(posted)) ? `Posted: ${posted}` : '';
+  }
+  if (!body) return null;
+  const address = job?.jobLocation?.address;
+  const location = [address?.addressLocality, address?.addressRegion, address?.addressCountry]
+    .filter(value => typeof value === 'string' && value.trim()).join(', ');
+  return {
+    url: postingUrl,
+    title: compactText(title, 300),
+    text: compactText([location ? `Location: ${location}` : '', date, body].filter(Boolean).join('\n\n'), textCap),
+  };
+}
+
+/** Oracle's detail resource varies between tenants, but its job object uses these stable fields. */
+export function normalizeOracleJob(json, postingUrl, textCap = JD_TEXT_CAP, requisition = '') {
+  const first = Array.isArray(json?.items) ? json.items[0] : json;
+  const job = Array.isArray(first?.requisitionList) ? first.requisitionList[0] : first;
+  if (!job || typeof job !== 'object') return null;
+  // A tenant can return a syntactically valid but wrong object after a stale
+  // route.  When it exposes an identity field it must agree with the URL's
+  // requisition; absence is tolerated because several live tenants omit it.
+  if (requisition && (job.Id != null || job.RequisitionNumber != null)
+      && String(job.Id ?? job.RequisitionNumber) !== String(requisition)) return null;
+  const contentFields = [
+    job.Description, job.DescriptionStr, job.LongDescription, job.ShortDescriptionStr,
+    job.Qualifications, job.QualificationsStr, job.JobQualifications,
+    job.Responsibilities, job.ResponsibilitiesStr, job.JobResponsibilities,
+  ].map(value => jdHtmlToText(value || '')).filter(Boolean);
+  // Oracle tenants use different field names; preserve every populated
+  // official responsibility/qualification field once without echoing the same
+  // content when a tenant exposes aliases for it.
+  const body = [...new Map(contentFields.map(value => [value.replace(/\s+/g, ' ').trim(), value])).values()].join('\n\n');
+  if (!body) return null;
+  const title = typeof job.Title === 'string' ? job.Title : '';
+  const location = typeof job.PrimaryLocation === 'string' ? job.PrimaryLocation : '';
+  const posted = typeof job.PostedDate === 'string' && !Number.isNaN(Date.parse(job.PostedDate)) ? `Posted: ${job.PostedDate}` : '';
+  return { url: postingUrl, title: compactText(title, 300), text: compactText([location ? `Location: ${location}` : '', posted, body].filter(Boolean).join('\n\n'), textCap) };
+}
+
+async function fetchIcimsJd(apiUrl, postingUrl, textCap, timeoutMs) {
+  if (rejectPrivateOrInvalid(apiUrl)) return null;
+  const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(apiUrl, { headers: { accept: 'text/html', 'user-agent': DEFAULT_USER_AGENT }, redirect: 'error', signal: controller.signal });
+    if (!res.ok) return null;
+    return normalizeIcimsJobPosting(await res.text(), postingUrl, textCap);
+  } catch { return null; } finally { clearTimeout(timer); }
+}
+
+async function fetchSmartRecruitersJd(apiUrl, postingUrl, textCap, timeoutMs) {
+  if (rejectPrivateOrInvalid(apiUrl)) return null;
+  const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(apiUrl, { headers: { accept: 'application/json', 'user-agent': DEFAULT_USER_AGENT }, redirect: 'error', signal: controller.signal });
+    if (!res.ok) return null;
+    return normalizeSmartRecruitersJob(await res.json(), postingUrl, textCap);
+  } catch { return null; } finally { clearTimeout(timer); }
+}
+
+async function fetchOracleJd(apiUrl, postingUrl, textCap, timeoutMs, requisition) {
+  if (rejectPrivateOrInvalid(apiUrl)) return null;
+  const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(apiUrl, { headers: { accept: 'application/json', 'user-agent': DEFAULT_USER_AGENT }, redirect: 'error', signal: controller.signal });
+    if (!res.ok) return null;
+    return normalizeOracleJob(await res.json(), postingUrl, textCap, requisition);
+  } catch { return null; } finally { clearTimeout(timer); }
+}
+
+async function fetchOfficialHtmlJd(postingUrl, textCap, timeoutMs) {
+  if (rejectPrivateOrInvalid(postingUrl)) return null;
+  const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(postingUrl, { headers: { accept: 'text/html', 'user-agent': DEFAULT_USER_AGENT }, redirect: 'error', signal: controller.signal });
+    if (!res.ok) return null;
+    return normalizeOfficialHtmlJobPosting(await res.text(), postingUrl, textCap);
+  } catch { return null; } finally { clearTimeout(timer); }
+}
+
+async function fetchGreenhouseEmbeddedJd(resolved, postingUrl, textCap, timeoutMs) {
+  const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const embed = await fetch(resolved.apiUrl, { headers: { accept: 'text/html', 'user-agent': DEFAULT_USER_AGENT }, redirect: 'manual', signal: controller.signal });
+    const jobApi = await resolved.followEmbed?.(embed, resolved.parts);
+    if (!jobApi) return null;
+    return fetchGreenhouseJd(jobApi, postingUrl, textCap, timeoutMs);
+  } catch { return null; } finally { clearTimeout(timer); }
+}
+
 /**
  * ats id → fetcher. THE routing table `fetchJdViaKnownApi` dispatches through,
  * exported so the owned test can assert its key set IS `JD_TEXT_API_ATS`.
@@ -567,6 +720,18 @@ export const JD_FETCHERS = {
     fetchGreenhouseJd(resolved.apiUrl, url, textCap, timeoutMs),
   lever: (resolved, url, textCap, timeoutMs) =>
     fetchLeverJd(resolved.apiUrl, url, textCap, timeoutMs),
+  smartrecruiters: (resolved, url, textCap, timeoutMs) =>
+    fetchSmartRecruitersJd(resolved.apiUrl, url, textCap, timeoutMs),
+  icims: (resolved, url, textCap, timeoutMs) =>
+    fetchIcimsJd(resolved.apiUrl, url, textCap, timeoutMs),
+  'greenhouse-embedded': (resolved, url, textCap, timeoutMs) =>
+    fetchGreenhouseEmbeddedJd(resolved, url, textCap, timeoutMs),
+  oraclecloud: (resolved, url, textCap, timeoutMs) =>
+    fetchOracleJd(resolved.apiUrl, url, textCap, timeoutMs, resolved.parts.requisition),
+  paylocity: (_resolved, url, textCap, timeoutMs) =>
+    fetchOfficialHtmlJd(url, textCap, timeoutMs),
+  ey: (_resolved, url, textCap, timeoutMs) =>
+    fetchOfficialHtmlJd(url, textCap, timeoutMs),
 };
 
 /**
@@ -598,6 +763,38 @@ export async function fetchJdViaKnownApi(url, textCap = JD_TEXT_CAP, timeoutMs =
   const budgetMs = resolved.timeoutMs || timeoutMs;
   const result = await fetcher(resolved, url, textCap, budgetMs);
   return result ? { ...result, ats: resolved.ats } : null;
+}
+
+/**
+ * Structured companion to fetchJdViaKnownApi.  The legacy function above is
+ * intentionally text-or-null for callers that fall through to browser reads;
+ * this adapter lets queue/retry code preserve why that fallback is needed.
+ * A terminal expiry is emitted only for a provider that declares its exact
+ * per-job API 404 authoritative.  Wrapper and board failures stay unresolved.
+ */
+export async function fetchJdResultViaKnownApi(url, textCap = JD_TEXT_CAP, timeoutMs = WORKDAY_TIMEOUT_MS) {
+  const resolved = resolveAtsApi(url);
+  if (!resolved || !JD_TEXT_API_ATS.has(resolved.ats)) return { outcome: 'unavailable', reason: 'unsupported_route' };
+  const success = await fetchJdViaKnownApi(url, textCap, timeoutMs);
+  if (success) return { outcome: 'success', provider: success.ats, url: success.url, title: success.title || '', text: success.text };
+
+  const probeUrl = resolved.ats === 'paylocity' || resolved.ats === 'ey' ? url : resolved.apiUrl;
+  const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), resolved.timeoutMs || timeoutMs);
+  try {
+    const res = await fetch(probeUrl, {
+      headers: { accept: resolved.accept || 'application/json', 'user-agent': DEFAULT_USER_AGENT, ...resolved.headers },
+      redirect: resolved.followEmbed ? 'manual' : 'error', signal: controller.signal,
+    });
+    if (res.status === 401 || res.status === 403) return { outcome: 'blocked', provider: resolved.ats, status: res.status, reason: 'official_access_denied' };
+    if ([408, 425, 429].includes(res.status) || res.status >= 500) return { outcome: 'transient', provider: resolved.ats, status: res.status, reason: 'official_temporary_response' };
+    if ([404, 410].includes(res.status) && resolved.api404Authoritative) {
+      return { outcome: 'authoritative_expiry', provider: resolved.ats, status: res.status, official_url: url, source_code: `${resolved.ats}_api_gone`, authoritative_expiry: true };
+    }
+    if (!res.ok) return { outcome: 'unavailable', provider: resolved.ats, status: res.status, reason: 'official_route_unavailable' };
+    return { outcome: 'parse_failure', provider: resolved.ats, status: res.status, reason: 'official_response_not_a_substantive_matching_jd' };
+  } catch (error) {
+    return { outcome: 'transient', provider: resolved.ats, reason: error?.name === 'AbortError' ? 'official_request_timeout' : 'official_request_failed' };
+  } finally { clearTimeout(timer); }
 }
 
 /**

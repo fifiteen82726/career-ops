@@ -48,6 +48,7 @@ import {
   statePaths,
   updateResolutionRows,
 } from './sunny-company-state.mjs';
+import { parseSourceKey } from './sunny-source-identity.mjs';
 
 const execFileAsync = promisify(execFile);
 const CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -122,6 +123,11 @@ export function parseArgs(argv) {
 
 function clean(value) {
   return String(value ?? '').replace(/[\t\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+export function isEnvironmentOnlyTransportFailure(error) {
+  const message = clean(error?.message || error).toLowerCase();
+  return /(?:network access|networking) (?:is |was )?(?:disabled|restricted|not permitted)|(?:execution |network )?permission (?:is )?(?:denied|required)|disabled by (?:the )?(?:execution )?environment|err_network_access_denied/.test(message);
 }
 
 function employerRecord(row) {
@@ -579,6 +585,13 @@ export async function evaluateAtsCandidate(dolMatch, candidate, {
       careers_url: careersUrl,
     }, fetchContext);
     if (published.error || !published.owner) {
+      if (isEnvironmentOnlyTransportFailure(published.error)) return {
+        ...base,
+        status: 'environment_unavailable',
+        identity_status: 'environment_unavailable',
+        environment_only: true,
+        reason: clean(published.error),
+      };
       return {
         ...base,
         status: 'verification_error',
@@ -765,6 +778,95 @@ export async function commitPortalRepairs(repairs, options = {}) {
     return { doc: { ...doc, tracked_companies: entries }, additions: changed };
   }, options);
   return { updated: result.added, entries: result.entries, retries: result.retries };
+}
+
+function repairOrigin(repair) {
+  const origin = repair?.origin;
+  const parsed = parseSourceKey(origin?.source_key);
+  if (!parsed || parsed.version < 2 || !parsed.provider || !parsed.board_identifier
+    || !parsed.window?.posted_after || !parsed.window?.posted_before) {
+    throw new Error('Repair requires an exact source-v2/v3 origin; legacy source keys cannot supply a backfill window');
+  }
+  const window = origin?.original_window;
+  if (!window || window.posted_after !== parsed.window.posted_after || window.posted_before !== parsed.window.posted_before
+    || !window.timezone || !window.semantics) {
+    throw new Error('Repair origin window must exactly match its immutable source key');
+  }
+  const expectedIdentifier = identifierFromAtsUrl(parsed.provider, repair.expected_careers_url);
+  if (!expectedIdentifier || parsed.provider !== clean(repair.expected_provider || parsed.provider).toLowerCase()
+    || expectedIdentifier.toLowerCase() !== String(parsed.board_identifier).toLowerCase()) {
+    throw new Error('Repair origin does not identify the exact old provider board');
+  }
+  return { ...origin, parsed, original_window: { ...window } };
+}
+
+function repairBackfillRow(repair, origin, now) {
+  const admission = repair.admission;
+  const oldRoute = {
+    provider: origin.parsed.provider,
+    board_identifier: origin.parsed.board_identifier,
+    careers_url: repair.expected_careers_url,
+  };
+  const newRoute = {
+    provider: admission.provider,
+    board_identifier: admission.board_identifier,
+    careers_url: admission.careers_url,
+  };
+  return {
+    ...admission,
+    normalized_lead: clean(admission.normalized_lead) || normalizeCompanyIdentity(admission.preferred_name || repair.target_name),
+    preferred_name: clean(admission.preferred_name) || repair.target_name,
+    first_seen: now, last_seen: now, source_count: 1,
+    last_attempt_at: now, next_retry_at: '',
+    backfill_status: 'pending',
+    backfill_window_start: origin.original_window.posted_after,
+    backfill_window_end: origin.original_window.posted_before,
+    backfill_attempted_at: '', backfill_completed_at: '', backfill_error: '',
+    evidence: JSON.stringify({
+      kind: 'verified-portal-route-repair',
+      origin: { source_key: origin.source_key, origin_run_id: origin.parsed.origin_run_id || null,
+        original_window: origin.original_window, old_route: oldRoute },
+      new_route: newRoute,
+      official_evidence_url: repair.official_evidence_url,
+    }),
+    reason: 'Verified replacement queued for the exact originating source-gap window',
+  };
+}
+
+/**
+ * Commit a verified stale-route replacement and retain its immutable source-gap
+ * selector until an exact-board backfill can resolve the original exception.
+ */
+export async function commitPortalRepairsWithBackfill(repairs, {
+  dataRoot,
+  now = new Date(),
+  ...options
+} = {}) {
+  if (!Array.isArray(repairs)) throw new Error('repairs must be an array');
+  const stampedNow = new Date(now).toISOString();
+  const prepared = repairs.map(repair => ({ repair, origin: repairOrigin(repair) }));
+  const result = await commitPortalRepairs(repairs, { dataRoot, ...options });
+  if (!result.updated) return { ...result, queued: 0 };
+
+  await updateResolutionRows(current => {
+    const rows = current.map(row => ({ ...row }));
+    for (const { repair, origin } of prepared) {
+      const pending = repairBackfillRow(repair, origin, stampedNow);
+      const key = portalBoardKey(pending);
+      const index = rows.findIndex(row => portalBoardKey(row) === key);
+      if (index < 0) rows.push(pending);
+      else {
+        const existing = rows[index];
+        const completeSuperset = existing.backfill_status === 'complete'
+          && existing.backfill_window_start <= pending.backfill_window_start
+          && existing.backfill_window_end >= pending.backfill_window_end;
+        rows[index] = completeSuperset ? { ...existing, evidence: pending.evidence, reason: pending.reason }
+          : { ...existing, ...pending, first_seen: existing.first_seen || pending.first_seen };
+      }
+    }
+    return rows;
+  }, { dataRoot });
+  return { ...result, queued: prepared.length };
 }
 
 async function commitPortalMutation(transform, {
@@ -994,12 +1096,23 @@ export async function resolveCompanyLeads({
   transientMinutes = 180,
   forceRetry = false,
   concurrency = 6,
+  deadlineAt,
+  maxBoards = Infinity,
+  clock = () => new Date(),
   evaluateCandidate = evaluateAtsCandidate,
 } = {}) {
   if (!['nyc', 'remote'].includes(scope)) throw new Error('scope must be nyc or remote');
   if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 20) {
     throw new Error('concurrency must be an integer from 1 to 20');
   }
+  const deadline = deadlineAt == null ? null : new Date(deadlineAt);
+  if (deadline && Number.isNaN(deadline.getTime())) throw new Error('deadlineAt must be a valid timestamp');
+  if (!(maxBoards === Infinity || (Number.isInteger(maxBoards) && maxBoards > 0))) {
+    throw new Error('maxBoards must be a positive integer or Infinity');
+  }
+  // Bounded invocation must remain serial: a parallel worker could start more
+  // official-board checks after the budget was consumed.
+  if ((deadline || maxBoards !== Infinity) && concurrency > 1) concurrency = 1;
   if (concurrency > 1) {
     const grouped = new Map();
     for (const lead of leads || []) {
@@ -1019,7 +1132,7 @@ export async function resolveCompanyLeads({
         resolved[index] = await resolveCompanyLeads({
           leads: batches[index], scope, employers, candidates, portals, reviews, identityHolds,
           legacyReviews, currentState, now, backfillDays, unresolvedDays, transientMinutes,
-          forceRetry, concurrency: 1, evaluateCandidate,
+          forceRetry, concurrency: 1, deadlineAt: deadline, maxBoards, clock, evaluateCandidate,
         });
       }
     }));
@@ -1036,7 +1149,9 @@ export async function resolveCompanyLeads({
   }
   const results = [];
 
+  let attemptedBoards = 0;
   for (const aggregatedGroup of aggregateLeadCompanies(leads, scope)) {
+    if ((deadline && clock() >= deadline) || attemptedBoards >= maxBoards) break;
     const { directCandidates = [], ...group } = aggregatedGroup;
     const previousRows = previousByIdentity.get(group.normalized_lead) || [];
     const previous = previousRows.find(row => !portalBoardKey(row));
@@ -1047,6 +1162,7 @@ export async function resolveCompanyLeads({
     }
     const base = {
       ...group,
+      scope,
       last_attempt_at: new Date(now).toISOString(),
       backfill_status: 'not_applicable',
     };
@@ -1132,6 +1248,7 @@ export async function resolveCompanyLeads({
     }
 
     for (const candidate of matchedCandidates) {
+      if ((deadline && clock() >= deadline) || attemptedBoards >= maxBoards) break;
       const key = portalBoardKey({ provider: candidate.provider, board_identifier: candidate.identifier });
       if (retained.some(row => portalBoardKey(row) === key)) continue;
       const priorBoard = previousRows.find(row => portalBoardKey(row) === key);
@@ -1145,6 +1262,7 @@ export async function resolveCompanyLeads({
         results.push(priorBoard);
         continue;
       }
+      attemptedBoards += 1;
       const evaluated = await evaluateCandidate(dol, candidate, { reviews, identityHolds });
       const resolved = {
         ...base,
@@ -1158,8 +1276,9 @@ export async function resolveCompanyLeads({
         last_seen: group.last_seen,
         source_count: group.source_count,
         evidence: evaluated.evidence || group.evidence,
-        next_retry_at: isScannableAdmission(evaluated) ? '' : nextRetryAt(now,
+        next_retry_at: isScannableAdmission(evaluated) || evaluated.environment_only ? '' : nextRetryAt(now,
           evaluated.status === 'verification_error' ? { minutes: transientMinutes } : { days: unresolvedDays }),
+        ...(evaluated.environment_only ? { last_attempt_at: '' } : {}),
       };
       results.push(isScannableAdmission(evaluated) ? preserveBackfill(resolved, priorBoard, now, backfillDays) : resolved);
     }
@@ -1188,6 +1307,15 @@ export function writeJsonReceipt(paths, prefix, body, now = new Date()) {
   const path = join(paths.receipts, `${prefix}-${timestamp}-${randomUUID().slice(0, 8)}.json`);
   writeFileSync(path, `${JSON.stringify(body, null, 2)}\n`, 'utf8');
   return path;
+}
+
+export function writeResolutionFailureReceipt(paths, { scope, mode, deadlineAt, maxBoards, error, now = new Date() } = {}) {
+  return writeJsonReceipt(paths, `company-${scope}-${mode}-failed`, {
+    schema_version: 1, command: 'resolve', scope, mode, dry_run: false, status: 'error',
+    error: { name: error?.name || 'Error', message: clean(error?.message || error) },
+    deadline_at: deadlineAt == null ? null : new Date(deadlineAt).toISOString(), max_boards: maxBoards,
+    completed_at: new Date(now).toISOString(),
+  }, now);
 }
 
 function writeReviewQueue(paths, scope, rows, now = new Date()) {
@@ -1222,6 +1350,10 @@ export async function runResolution({
   mode = 'incremental',
   write = false,
   now = new Date(),
+  deadlineAt,
+  maxBoards = Infinity,
+  clock = () => new Date(),
+  commitAdmissions = commitPortalAdmissions,
 } = {}) {
   if (!['nyc', 'remote'].includes(scope)) throw new Error('scope must be nyc or remote');
   if (!['backfill', 'incremental'].includes(mode)) throw new Error('mode must be backfill or incremental');
@@ -1254,6 +1386,9 @@ export async function runResolution({
     unresolvedDays: Number(config.retry?.unresolved_days || 7),
     transientMinutes: Number(config.retry?.transient_minutes || 180),
     concurrency: Number(config.resolution_concurrency || 6),
+    deadlineAt,
+    maxBoards,
+    clock,
     forceRetry: mode === 'backfill',
   });
 
@@ -1261,10 +1396,16 @@ export async function runResolution({
   let portalResult = { added: 0, entries: [] };
   if (write) {
     try {
-      portalResult = await commitPortalAdmissions(rows.filter(isScannableAdmission), { dataRoot });
+      portalResult = await commitAdmissions(rows.filter(isScannableAdmission), { dataRoot });
     } catch (error) {
       await recordPortalCommitFailure(rows, error, { dataRoot, now,
         transientMinutes: Number(config.retry?.transient_minutes || 180) });
+      // The resolver owns this failure; write its terminal evidence before
+      // propagating so the outer routine receipt is supplementary, not the
+      // sole record of a real portal CAS failure.
+      error.receipt_path = writeResolutionFailureReceipt(paths, {
+        scope, mode, deadlineAt, maxBoards, error, now,
+      });
       throw error;
     }
   }
@@ -1281,6 +1422,9 @@ export async function runResolution({
     board_resolution_rows: rows.length,
     outcomes: statusCounts(rows),
     portal_additions: portalResult.added,
+    deadline_at: deadlineAt == null ? null : new Date(deadlineAt).toISOString(),
+    max_boards: maxBoards,
+    deferred_deadline: deadlineAt != null && clock() >= new Date(deadlineAt),
     review_queue: reviewQueue,
     completed_at: new Date(now).toISOString(),
   };
@@ -1320,6 +1464,7 @@ export function isInsidePreNoonGuard(now = new Date(), guardMinutes = 30) {
 
 export async function runPendingBackfills({
   dataRoot = getCareerOpsRoot(),
+  scope,
   now = new Date(),
   ignoreGuard = false,
   scan,
@@ -1328,6 +1473,7 @@ export async function runPendingBackfills({
   signal,
   clock = () => new Date(),
 } = {}) {
+  if (scope !== undefined && !['nyc', 'remote'].includes(scope)) throw new Error('scope must be nyc or remote');
   const normalizedDeadline = deadlineAt == null ? null : new Date(deadlineAt);
   if (normalizedDeadline && Number.isNaN(normalizedDeadline.getTime())) throw new Error('deadlineAt must be a valid timestamp');
   const boardLimit = Number(maxBoards);
@@ -1368,6 +1514,7 @@ export async function runPendingBackfills({
       });
       const runningBoards = new Set(settled.filter(row => row.backfill_status === 'running').map(portalBoardKey));
       const eligible = row => row.status === 'accepted' && !!portalBoardKey(row)
+        && (scope === undefined || row.scope === scope)
         && ['pending', 'retry_error', 'retry_partial'].includes(row.backfill_status)
         && !runningBoards.has(portalBoardKey(row))
         && !attempted.has(portalBoardKey(row));
@@ -1388,6 +1535,13 @@ export async function runPendingBackfills({
     let scanResult;
     let completion = 'error';
     try {
+      let recoveryOf;
+      try {
+        const origin = JSON.parse(claimed.evidence || '{}')?.origin;
+        if (origin?.source_key && origin?.original_window?.posted_after && origin?.original_window?.posted_before) {
+          recoveryOf = { source_key: origin.source_key, origin_run_id: origin.origin_run_id || null, original_window: origin.original_window };
+        }
+      } catch { /* legacy rows retain their ordinary anchored backfill */ }
       scanResult = await scanner({
         kind: 'backfill',
         dataRoot,
@@ -1395,6 +1549,7 @@ export async function runPendingBackfills({
         boardIdentifier: claimed.board_identifier,
         postedAfter: claimed.backfill_window_start,
         postedBefore: claimed.backfill_window_end,
+        ...(recoveryOf ? { recoveryOf } : {}),
       });
       if (signal?.aborted || (normalizedDeadline && clock() >= normalizedDeadline)) {
         scanResult = { completion_status: 'partial', error: 'deadline reached during exact-board backfill' };

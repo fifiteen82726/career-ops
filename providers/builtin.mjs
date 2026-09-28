@@ -494,7 +494,10 @@ export default {
             { redirect: 'error', headers: { 'User-Agent': BROWSER_LIKE_USER_AGENT } },
             RETRY_POLICY,
           ));
-        } catch {
+        } catch (error) {
+          // Keep rows from earlier pages/bases, but let bounded orchestrators
+          // record that this source is partial rather than a clean success.
+          ctx?.onError?.(error, url);
           break; // network/HTTP error (e.g. past the last page) — stop this base
         }
         const jobs = parseListPage(html);

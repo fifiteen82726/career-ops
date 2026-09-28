@@ -8,6 +8,7 @@ import * as yaml from 'js-yaml';
 import {
   buildExactBoardPortals,
   classifyScanCompletion,
+  frozenDailyWindow,
   runSerializedScan,
   withSunnyScanLock,
 } from '../data/tools/run-sunny-serialized-scan.mjs';
@@ -15,6 +16,25 @@ import { readPendingJobs } from '../data/tools/sunny-job-queue.mjs';
 import { readExceptionQueue } from '../data/tools/sunny-exception-store.mjs';
 
 const validReceipt = { version: 'careerops.scan.receipt@1', errors: [], added_urls: [] };
+
+test('daily window is frozen in New York calendar dates before a child scan begins', () => {
+  assert.deepEqual(frozenDailyWindow(new Date('2026-09-23T02:00:00.000Z'), 3), {
+    posted_after: '2026-09-19', posted_before: '2026-09-22', timezone: 'America/New_York', semantics: 'calendar-date-inclusive',
+  });
+});
+
+test('daily child receives the frozen absolute window rather than recomputing --since', async t => {
+  const dataRoot = mkdtempSync(join(tmpdir(), 'sunny-frozen-daily-child-'));
+  t.after(() => rmSync(dataRoot, { recursive: true, force: true }));
+  mkdirSync(join(dataRoot, 'data'), { recursive: true });
+  let args;
+  const result = await runSerializedScan({
+    kind: 'daily', dataRoot, since: 3, now: new Date('2026-09-23T02:00:00.000Z'), routineLease: false,
+    runChild: async input => { args = input.args; return { exitCode: 0, stdout: JSON.stringify(validReceipt), stderr: '' }; },
+  });
+  assert.deepEqual(args, ['--posted-after', '2026-09-19', '--posted-before', '2026-09-22', '--quiet', '--json']);
+  assert.deepEqual(result.original_window, frozenDailyWindow(new Date('2026-09-23T02:00:00.000Z'), 3));
+});
 
 const fullConfig = {
   title_filter: { positive: ['word:data'] },
@@ -96,6 +116,14 @@ test('partial and error scans cannot complete an anchored backfill', () => {
   }), 'error');
 });
 
+test('structured incomplete observations prevent a false complete receipt', () => {
+  assert.equal(classifyScanCompletion({
+    exitCode: 0,
+    stderr: '',
+    receipt: { ...validReceipt, source_observations: [{ complete: false, outcome: 'incomplete_coverage' }] },
+  }), 'partial');
+});
+
 test('missing receipt is an error and errors take precedence over partial warnings', () => {
   assert.equal(classifyScanCompletion({ exitCode: 0, receipt: null }), 'error');
   assert.equal(classifyScanCompletion({ exitCode: 0, receipt: {} }), 'error');
@@ -142,6 +170,19 @@ test('backfill receipt is bound to the exact provider and board identifier', asy
   assert.equal(result.posted_before, '2026-09-08');
   assert.match(result.receipt_path, /data\/company-discovery\/receipts\//);
   assert.equal(readPendingJobs({ dataRoot }).length, 1, 'wrapper persists added URLs, not just a receipt');
+});
+
+test('a recovery backfill receipt links to its immutable source gap without rewriting it', async t => {
+  const dataRoot = mkdtempSync(join(tmpdir(), 'sunny-recovery-receipt-'));
+  t.after(() => rmSync(dataRoot, { recursive: true, force: true }));
+  mkdirSync(join(dataRoot, 'data'), { recursive: true });
+  writeFileSync(join(dataRoot, 'portals.yml'), yaml.dump(fullConfig), 'utf8');
+  const recoveryOf = { source_key: 'source-v2|greenhouse|clear|2026-08-20|2026-09-08|transient', origin_run_id: 'daily-origin', original_window: { posted_after: '2026-08-20', posted_before: '2026-09-08', timezone: 'America/New_York' } };
+  const result = await runSerializedScan({ kind: 'backfill', dataRoot, provider: 'greenhouse', boardIdentifier: 'clear', postedAfter: '2026-08-20', postedBefore: '2026-09-08', recoveryOf, routineLease: false,
+    runChild: async () => ({ exitCode: 0, stdout: JSON.stringify(validReceipt), stderr: '' }),
+  });
+  assert.deepEqual(result.recovery_of, recoveryOf);
+  assert.deepEqual(JSON.parse(readFileSync(result.receipt_path, 'utf8')).recovery_of, recoveryOf);
 });
 
 test('a partial scan queues valid URLs and records its source failure independently', async t => {
@@ -233,4 +274,21 @@ test('uses a caller-persisted scan id in the receipt', async t => {
   }) });
   assert.equal(result.run_id, 'claimed-scan-id');
   assert.equal(existsSync(join(dataRoot, 'local/sunny-job-search/data/scan-status.json')), true);
+});
+
+test('recovery child retains the original gap identity instead of its new invocation id', async t => {
+  const dataRoot = mkdtempSync(join(tmpdir(), 'sunny-continuation-origin-'));
+  t.after(() => rmSync(dataRoot, { recursive: true, force: true }));
+  mkdirSync(join(dataRoot, 'data'), { recursive: true });
+  let childEnv;
+  await runSerializedScan({
+    kind: 'daily', dataRoot, routineLease: false, runId: 'retry-invocation-2',
+    recoveryOf: { origin_run_id: 'original-gap-1' },
+    runChild: async ({ env }) => {
+      childEnv = env;
+      return { exitCode: 0, stdout: JSON.stringify({ ...validReceipt, added_urls: [], errors: [] }), stderr: '' };
+    },
+  });
+  assert.equal(childEnv.CAREER_OPS_ORIGIN_GAP, 'original-gap-1');
+  assert.equal(childEnv.CAREER_OPS_SCAN_RUN_ID, 'retry-invocation-2');
 });

@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { isMainModule } from '../../lib/is-main-module.mjs';
 import { normalizeCompanyIdentity } from './build-sunny-h1b-ats-universe.mjs';
 import { recordFailure } from './sunny-exception-store.mjs';
+import { isSourceKey, sourceIdentityKey } from './sunny-source-identity.mjs';
 
 const COVERAGE_WARNING = /\b(?:partial|truncat(?:ed|ion)?|max[-_ ]?pages?)\b/i;
 
@@ -32,8 +33,40 @@ function companyOf(value, receipt) {
 }
 
 export function scanErrorClass(message) {
+  if (/unexpected redirect|redirect(?:ed)?\b|retired[ -]?route/i.test(message)) return 'retired_route';
+  if (/\b(?:401|403)\b|\bblocked\b|access denied/i.test(message)) return 'blocked';
+  if (/unsupported provider|no provider|not supported/i.test(message)) return 'unsupported';
+  if (/parse|malformed|invalid json|unexpected token/i.test(message)) return 'parse_failure';
   if (/\b(?:429|5\d\d)\b|timeout|abort|fetch failed/i.test(message)) return 'transient';
   return 'error';
+}
+
+function normalizedOutcomeClass(value, fallback) {
+  const outcome = String(value || '').toLowerCase();
+  if (['retired_route', 'blocked', 'unsupported', 'parse_failure', 'coverage'].includes(outcome)) return outcome;
+  if (['incomplete_coverage'].includes(outcome)) return 'coverage';
+  if (['network', 'server', 'transient_failure', 'transient'].includes(outcome)) return 'transient';
+  return fallback;
+}
+
+function sourceWindow(receipt) {
+  const explicit = receipt.original_window || receipt.window;
+  if (explicit && typeof explicit === 'object' && explicit.posted_after && explicit.posted_before) return explicit;
+  if (receipt.posted_after && receipt.posted_before) return {
+    posted_after: receipt.posted_after, posted_before: receipt.posted_before,
+    timezone: receipt.window_timezone || 'America/New_York', semantics: receipt.window_semantics || 'calendar-date-inclusive',
+  };
+  return null;
+}
+
+/**
+ * New receipts get an exact immutable key.  Older receipts are intentionally
+ * left on their legacy company key when they cannot prove provider+board+window;
+ * manufacturing those coordinates from today's portals would make recovery
+ * look precise while selecting the wrong source.
+ */
+export function sourceExceptionKey({ runId, provider, board, window, type, legacyBoard }) {
+  return sourceIdentityKey({ runId, provider, board, window, type, legacyBoard });
 }
 
 /** Record source errors and coverage warnings without touching normal job intake. */
@@ -44,37 +77,57 @@ export async function ingestScanReceiptExceptions(receipt = {}, {
 } = {}) {
   const scanReceipt = receipt.scan_receipt || {};
   const errors = Array.isArray(scanReceipt.errors) ? scanReceipt.errors : [];
+  const observations = Array.isArray(scanReceipt.source_observations) ? scanReceipt.source_observations : [];
   const warnings = [
     ...(Array.isArray(receipt.warnings) ? receipt.warnings : []),
     ...(Array.isArray(scanReceipt.warnings) ? scanReceipt.warnings : []),
   ];
   const failedAt = receipt.finished_at || receipt.started_at || now;
   const failures = new Map();
+  const addFailure = ({ provider, exactBoard, board, window, type, message, evidence }) => {
+    const key = sourceExceptionKey({ runId: receipt.run_id, provider, board: exactBoard, window, type, legacyBoard: board });
+    const existing = failures.get(key);
+    if (existing) {
+      existing.evidence.observations = [...(existing.evidence.observations || []), evidence];
+      if (evidence.type === 'source_observation') existing.evidence.outcome_class = type;
+      return;
+    }
+    failures.set(key, { key, stage: 'scan', message, evidence: { ...evidence, outcome_class: type, observations: [evidence] } });
+  };
 
   for (const error of errors) {
     const message = textOf(error);
     if (!message) continue;
-    const errorClass = scanErrorClass(message);
-    const key = `source|${companyOf(error, receipt)}|${errorClass}`;
+    const errorClass = normalizedOutcomeClass(error?.kind || error?.outcome, scanErrorClass(message));
     const board = companyOf(error, receipt);
-    failures.set(key, {
-      key,
-      stage: 'scan',
-      message,
-      evidence: { receipt_run_id: receipt.run_id || '', type: 'error', detail: error, board, provider: error.provider || receipt.provider || '', window: receipt.window || receipt.posted_after || receipt.since_days || '' },
-    });
+    const provider = error?.provider || error?.actual_provider || receipt.provider || '';
+    const exactBoard = error?.board_identifier || error?.board || error?.identifier || '';
+    const window = sourceWindow(receipt);
+    const windowEvidence = window || receipt.window || receipt.posted_after || receipt.since_days || '';
+    addFailure({ provider, exactBoard, board, window, type: errorClass, message,
+      evidence: { receipt_run_id: receipt.run_id || '', type: 'error', detail: error, board, board_identifier: exactBoard || null, provider, window: windowEvidence } });
+  }
+  for (const observation of observations) {
+    if (observation?.complete !== false) continue;
+    const errorClass = normalizedOutcomeClass(observation.outcome, scanErrorClass(textOf(observation)));
+    const board = companyOf(observation, receipt);
+    const provider = observation.provider || '';
+    const exactBoard = observation.board_identifier || '';
+    const window = sourceWindow(receipt);
+    addFailure({ provider, exactBoard, board, window, type: errorClass, message: textOf(observation.error_name || observation.outcome || 'source incomplete'),
+      evidence: { receipt_run_id: receipt.run_id || '', type: 'source_observation', detail: observation, board, board_identifier: exactBoard || null, provider,
+        window: window || receipt.window || receipt.posted_after || receipt.since_days || '' } });
   }
   for (const warning of warnings) {
     const message = textOf(warning);
     if (!message || !COVERAGE_WARNING.test(message)) continue;
     const board = companyOf(warning, receipt);
-    const key = `source|${board}|coverage`;
-    failures.set(key, {
-      key,
-      stage: 'scan',
-      message,
-      evidence: { receipt_run_id: receipt.run_id || '', type: 'coverage_warning', detail: warning, board, provider: warning?.provider || receipt.provider || (/\bjibe(?:apply)?\b/i.test(message) ? 'jibe' : ''), window: receipt.window || receipt.posted_after || receipt.since_days || '' },
-    });
+    const provider = warning?.provider || receipt.provider || (/\bjibe(?:apply)?\b/i.test(message) ? 'jibe' : '');
+    const exactBoard = warning?.board_identifier || warning?.board || warning?.identifier || '';
+    const window = sourceWindow(receipt);
+    const windowEvidence = window || receipt.window || receipt.posted_after || receipt.since_days || '';
+    addFailure({ provider, exactBoard, board, window, type: 'coverage', message,
+      evidence: { receipt_run_id: receipt.run_id || '', type: 'coverage_warning', detail: warning, board, board_identifier: exactBoard || null, provider, window: windowEvidence } });
   }
 
   const items = [];
@@ -89,7 +142,7 @@ export async function ingestScanReceiptExceptions(receipt = {}, {
 
 export async function applySourceOutcome(input = {}, { dataRoot = input.dataRoot || getCareerOpsRoot() } = {}) {
   const key = String(input.key || '');
-  if (!key.startsWith('source|')) throw new Error('Source outcome requires an exact source key');
+  if (!isSourceKey(key)) throw new Error('Source outcome requires an exact source key');
   const items = (await import('./sunny-exception-store.mjs')).readExceptionQueue({ dataRoot, queue: 'source' });
   const item = items.find(value => value.key === key);
   if (!item) throw new Error('Source exception not found');
@@ -97,7 +150,8 @@ export async function applySourceOutcome(input = {}, { dataRoot = input.dataRoot
   if (input.outcome !== 'resolve') throw new Error('Source outcome must be failure or resolve');
   const coverage = input.evidence?.coverage;
   const origin = item.origin_evidence || item.evidence || {};
-  if (key.endsWith('|coverage') && (!coverage || coverage.board !== key.split('|')[1] || !coverage.window || coverage.complete !== true || coverage.probe_only === true || coverage.type === 'probe' || !origin.provider || !origin.window || coverage.provider !== origin.provider || coverage.window !== origin.window)) throw new Error('Coverage resolution requires complete exact board, provider, and originating window evidence');
+  const legacyBoard = key.startsWith('source|') ? key.split('|')[1] : null;
+  if (!coverage || coverage.complete !== true || coverage.probe_only === true || coverage.type === 'probe' || !origin.provider || !origin.window || coverage.provider !== origin.provider || JSON.stringify(coverage.window) !== JSON.stringify(origin.window) || (legacyBoard && coverage.board !== legacyBoard) || (origin.board_identifier && coverage.board_identifier !== origin.board_identifier)) throw new Error('Source resolution requires complete exact board, provider, and originating window evidence');
   // Use an explicit resolved record operation in the shared store without making
   // connectivity a proxy for coverage. The low-level mutation remains lock-safe.
   const { resolveException } = await import('./sunny-exception-store.mjs');

@@ -103,39 +103,75 @@ export default {
     const apiUrl = (typeof entry.api === 'string' && validateExplicitApi(entry.api))
       || toApiUrl(url);
     if (!apiUrl) throw new Error(`jibeapply: cannot derive API URL for ${entry.name}`);
-    const first = await ctx.fetchJson(apiUrl, { redirect: 'error' });
-    const total = first.totalCount ?? 0;
+    // A continuation ledger is optional so legacy provider callers remain
+    // arrays-only.  When supplied, an unacknowledged page is replayed before
+    // any cursor request.  The scanner acknowledges only after its normal
+    // intake transaction has persisted the returned jobs.
+    const continuation = ctx?.continuation;
+    const prior = continuation?.snapshot?.();
+    const replay = continuation?.pending?.() || [];
+    const savedPages = new Set(replay.map(page => page.identity));
+    const replayJobs = replay.flatMap(page => Array.isArray(page.payload?.jobs) ? page.payload.jobs : []);
+    const resume = prior?.observed_total != null && prior?.page_size > 0 && Number(prior?.next_page) > 1;
+    const first = resume ? null : await ctx.fetchJson(apiUrl, { redirect: 'error' });
+    const total = resume ? prior.observed_total : (first.totalCount ?? 0);
     // Use the actual number of items returned as page size — some implementations
     // set `count` to the total rather than the per-page count.
-    const pageSize = first.jobs?.length || first.count || DEFAULT_PAGE_SIZE;
-    const allJobs = [...(first.jobs ?? [])];
+    const pageSize = resume ? prior.page_size : (first.jobs?.length || first.count || DEFAULT_PAGE_SIZE);
+    // Page 1 must be durable before any later page is requested.  A process
+    // loss after this point therefore replays this payload instead of silently
+    // treating a later cursor as evidence that it was consumed.
+    if (continuation && !resume && !savedPages.has('page:1')) {
+      continuation.savePage('page:1', first, { page: 1, total, page_size: pageSize });
+      savedPages.add('page:1');
+    }
+    const allJobs = [...replayJobs, ...(first?.jobs ?? [])];
+    let incomplete = false;
+    let stopReason = '';
+    let startPage = Math.max(2, Number(prior?.next_page) || 2);
 
     if (total > pageSize && pageSize > 0) {
+      // `max_pages` is bounded work for this invocation, never a permanent
+      // cursor ceiling.  A four-page board with max_pages:2 must resume at
+      // pages 3–4 next time instead of declaring its first two pages final.
       const maxPages = resolveMaxPages(entry);
-      const pages = Math.min(Math.ceil(total / pageSize), maxPages);
+      const pages = Math.ceil(total / pageSize);
       // Sequential, not concurrent (mirrors providers/4dayweek.mjs, thehub.mjs,
       // arbeitnow.mjs, workday.mjs) — a single tenant's API has no reason to
       // receive a burst of parallel requests, and a mid-run failure stops
       // cleanly with whatever pages were already gathered instead of
       // discarding them (Promise.all would fail the whole batch on one error).
-      for (let page = 2; page <= pages; page++) {
+      // Cursor state is page identity, never aggregate row count: duplicate
+      // jobs or a partial final page cannot move the next page incorrectly.
+      startPage = Math.max(2, Number(prior?.next_page) || 2);
+      const invocationBudget = Number.isInteger(ctx?.maxPages) && ctx.maxPages > 0 ? ctx.maxPages : maxPages;
+      const invocationPages = Math.min(pages, resume ? startPage + invocationBudget - 1 : invocationBudget);
+      for (let page = startPage; page <= invocationPages; page++) {
         const u2 = new URL(apiUrl);
         u2.searchParams.set('page', String(page));
         let json;
         try {
           json = await ctx.fetchJson(u2.toString(), { redirect: 'error' });
         } catch (err) {
+          incomplete = true;
+          stopReason = `page_${page}_failure`;
           console.error(`⚠️  jibeapply: ${entry.name} page ${page} fetch failed — ${err.message} (returning ${allJobs.length} jobs fetched so far)`);
           break;
         }
+        const identity = `page:${page}`;
+        continuation?.savePage?.(identity, json, { page, total, page_size: pageSize });
+        savedPages.add(identity);
         allJobs.push(...(json.jobs ?? []));
+        continuation?.state?.({ next_page: page + 1, observed_total: total, page_size: pageSize, fetched_pages: [...savedPages], unique_job_ids: [...new Set(allJobs.map(job => String(job?.data?.slug || job?.slug || job?.data?.req_id || job?.req_id || '')))].filter(Boolean), stop_reason: '' });
       }
 
       // The cap is silent by design (it's a safety net, not a working limit),
       // but a tenant that actually exceeds it needs to be surfaced —
       // otherwise the user has no way to notice postings are missing from
       // their scan.
-      if (Math.ceil(total / pageSize) > maxPages) {
+      if (Math.ceil(total / pageSize) > invocationPages) {
+        incomplete = true;
+        stopReason ||= invocationPages < pages ? 'invocation_budget' : 'page_cap';
         console.error(
           `⚠️  jibeapply: ${entry.name} has more postings than max_pages allows ` +
           `(fetched ${allJobs.length} of ${total}) — ` +
@@ -144,6 +180,20 @@ export default {
       }
     }
 
-    return parseJibeapplyResponse({ jobs: allJobs }, entry);
+    const parsed = parseJibeapplyResponse({ jobs: allJobs }, entry);
+    if (continuation) {
+      // First page is a page too.  It is durable before the cursor is allowed
+      // to pass it, and its identity stays stable across a replay.
+      const nextPage = incomplete ? Math.max(2, startPage + [...savedPages].filter(identity => /^page:\d+$/.test(identity) && Number(identity.slice(5)) >= startPage).length) : Math.ceil(total / pageSize) + 1;
+      continuation.state({ next_page: nextPage, observed_total: total, page_size: pageSize, stop_reason: stopReason || (incomplete ? 'still_incomplete' : 'complete') });
+      parsed.continuationPages = continuation.pending().map(page => page.identity);
+      parsed.continuationComplete = !incomplete;
+    }
+    if (incomplete) {
+      parsed.jibeapplyTruncated = true;
+      parsed.jibeapplyContinuation = { next_page: Math.ceil(allJobs.length / pageSize) + 1, total, page_size: pageSize, fetched: allJobs.length, stop_reason: stopReason };
+      continuation?.incomplete?.({ type: stopReason || 'still_incomplete', provider: 'jibeapply', complete: false });
+    }
+    return parsed;
   },
 };

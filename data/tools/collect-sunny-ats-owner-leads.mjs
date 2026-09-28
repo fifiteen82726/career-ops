@@ -53,6 +53,7 @@ import {
   directAtsCandidateFromLeadUrl,
   joinLeadToDol,
   loadDolEvidence,
+  isEnvironmentOnlyTransportFailure,
   portalBoardKey,
   portalEntryBoardKey,
 } from './sunny-company-expansion.mjs';
@@ -201,6 +202,7 @@ export function boardCoordinates(provider, identifier) {
 }
 
 export function ownerRecordNeedsRefresh(record, now = new Date()) {
+  if (record?.environment_only === true || record?.status === 'environment_unavailable') return true;
   if (!record?.checked_at) return true;
   const checked = Date.parse(record.checked_at);
   if (!Number.isFinite(checked)) return true;
@@ -519,6 +521,18 @@ async function fetchIcimsOwnerRecord(identifier, ctx, now) {
       errors.push(`${host}: ${clean(error?.message || error)}`);
     }
   }
+  const error = errors.join('; ') || 'no valid iCIMS host';
+  if (isEnvironmentOnlyTransportFailure(error)) return {
+    provider: 'icims',
+    identifier,
+    directory_identifier: identifier,
+    board_identifier: '',
+    owner: '',
+    status: 'environment_unavailable',
+    environment_only: true,
+    checked_at: new Date(now).toISOString(),
+    error,
+  };
   return {
     provider: 'icims',
     identifier,
@@ -527,7 +541,7 @@ async function fetchIcimsOwnerRecord(identifier, ctx, now) {
     owner: '',
     status: 'error',
     checked_at: new Date(now).toISOString(),
-    error: errors.join('; ') || 'no valid iCIMS host',
+    error,
   };
 }
 
@@ -555,6 +569,19 @@ export async function fetchOwnerRecord(provider, identifier, ctx, now) {
     const publishedJob = published.payload === undefined
       ? null
       : firstPublishedJob(provider, identifier, published.payload);
+    if (!owner && isEnvironmentOnlyTransportFailure(published.error)) {
+      return {
+        provider,
+        identifier,
+        directory_identifier: identifier,
+        board_identifier: '',
+        owner: '',
+        status: 'environment_unavailable',
+        environment_only: true,
+        checked_at: new Date(now).toISOString(),
+        error: clean(published.error),
+      };
+    }
     return {
       provider,
       identifier,
@@ -568,6 +595,17 @@ export async function fetchOwnerRecord(provider, identifier, ctx, now) {
       error: owner ? '' : clean(published.error || published.reason || 'published owner missing'),
     };
   } catch (error) {
+    if (isEnvironmentOnlyTransportFailure(error)) return {
+      provider,
+      identifier,
+      directory_identifier: identifier,
+      board_identifier: '',
+      owner: '',
+      status: 'environment_unavailable',
+      environment_only: true,
+      checked_at: new Date(now).toISOString(),
+      error: clean(error?.message || error),
+    };
     return {
       provider,
       identifier,
@@ -802,7 +840,12 @@ async function main() {
       const batch = due.slice(offset, offset + 100);
       const records = await mapConcurrent(batch, args.concurrency,
         identifier => fetchOwnerRecord(provider, identifier, ctx, startedAt));
-      for (const record of records) byKey.set(ownerCacheKey(record), record);
+      for (const record of records) {
+        // A disabled/restricted execution context made no useful board
+        // observation. Preserve prior canonical evidence and never create a
+        // seven-day negative identity cache entry from it.
+        if (!record.environment_only) byKey.set(ownerCacheKey(record), record);
+      }
       done += records.length;
       atomicJson(cachePath, {
         schema_version: 1,

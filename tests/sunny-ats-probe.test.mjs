@@ -53,6 +53,17 @@ test('probe requires DOL collision-free identity, current live jobs and owner ve
   assert.ok(failed[0].next_retry_at > now.toISOString());
 });
 
+test('explicit disabled-network failures remain visible without consuming a probe retry attempt', async () => {
+  const [row] = await probeCandidates([candidate('Example')], {
+    employers, now,
+    verify: async () => { throw new Error('network access disabled by execution permission'); },
+  });
+  assert.equal(row.status, 'environment_unavailable');
+  assert.equal(row.last_attempt_at, '');
+  assert.equal(row.next_retry_at, '');
+  assert.match(row.reason, /network access disabled/i);
+});
+
 test('existing no-provider row is repaired exactly; working other board permits addition; duplicate names require review', () => {
   const row = { preferred_name: 'Example Inc.', dol_legal_name: 'Example Inc.', transfer_positions: 2,
     status: 'accepted', health_status: 'live', identity_status: 'owner_verified', provider: 'greenhouse',

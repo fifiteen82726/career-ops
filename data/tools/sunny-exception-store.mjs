@@ -7,6 +7,7 @@ import { getCareerOpsRoot } from '../../path-resolver.mjs';
 import { acquirePipelineLock } from '../../pipeline-lock.mjs';
 import { canonicalLeadUrl } from './sunny-company-leads.mjs';
 import { normalizeJobQueueDocument } from './sunny-job-queue.mjs';
+import { isSourceKey, parseSourceKey } from './sunny-source-identity.mjs';
 
 export const RETRY_DELAYS_DAYS = [1, 2, 4];
 
@@ -37,13 +38,26 @@ function iso(value, label) {
 
 function normalizedQueue(failure = {}) {
   if (typeof failure === 'string') return '';
-  return String(failure.queue || failure.kind || failure.type || (String(failure.key || '').split('|')[0]) || '').toLowerCase();
+  const value = String(failure.queue || failure.kind || failure.type || (String(failure.key || '').split('|')[0]) || '').toLowerCase();
+  return ['source-v2', 'source-v3'].includes(value) ? 'source' : value;
 }
 
 export function classifyFailure(failure = {}) {
   const message = typeof failure === 'string' ? failure : `${failure.message || ''} ${failure.evidence || ''}`;
   const isCandidate = normalizedQueue(failure) === 'candidate';
-  if (isCandidate && /(?:\b404\b|job no longer available|\b(?:job|posting|position|role)\s+(?:has\s+)?expired\b|\bexpired\s+(?:job|posting|position|role)\b)/i.test(message)) return { action: 'closed' };
+  // A wrapper/board 404 and a string which happens to say "expired" are not
+  // evidence about the candidate's job.  Only a caller that has interpreted
+  // the official job-level response may terminally close it.
+  if (isCandidate && failure?.evidence?.authoritative_expiry === true
+      && typeof failure.evidence?.official_url === 'string'
+      && failure.evidence.official_url.startsWith('https://')
+      && typeof failure.evidence?.source_code === 'string'
+      && failure.evidence.source_code.trim()) return { action: 'closed' };
+  // Deterministic source failures need route/owner diagnosis, not blind retry.
+  // `outcome_class` is structured receipt evidence; old string-only entries
+  // retain their historical retry behavior until re-observed.
+  const sourceClass = failure?.evidence?.outcome_class;
+  if (!isCandidate && ['retired_route', 'blocked', 'unsupported', 'parse_failure'].includes(sourceClass)) return { action: 'needs_diagnosis' };
   return { action: 'retryable' };
 }
 
@@ -55,6 +69,16 @@ export function nextRetryAt(failedAt, attemptCount) {
   const date = new Date(iso(failedAt, 'failure timestamp'));
   date.setUTCDate(date.getUTCDate() + RETRY_DELAYS_DAYS[attempt - 1]);
   return date.toISOString();
+}
+
+function observedRetryAfterAt(failure, failedAt) {
+  const evidence = failure?.evidence || {};
+  const raw = evidence.retry_after || evidence.detail?.retry_after || evidence.detail?.retryAfter;
+  if (raw === undefined || raw === null || raw === '') return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return new Date(new Date(failedAt).getTime() + seconds * 1000).toISOString();
+  const parsed = Date.parse(raw);
+  return Number.isNaN(parsed) ? null : new Date(parsed).toISOString();
 }
 
 async function updateStore(fn, { dataRoot = getCareerOpsRoot(), lockOptions, ...options } = {}) {
@@ -137,12 +161,14 @@ export async function recordFailure(failure, options = {}) {
     if (classification.action === 'closed') {
       item.status = 'closed';
       item.next_retry_at = null;
-    } else if (item.attempt_count >= 3) {
+    } else if (classification.action === 'needs_diagnosis' || item.attempt_count >= 3) {
       item.status = 'needs_diagnosis';
       item.next_retry_at = null;
     } else {
       item.status = 'retryable';
-      item.next_retry_at = nextRetryAt(item.last_failed_at, item.attempt_count);
+      const requestedRetryAt = failure.next_retry_at ?? failure.nextRetryAt ?? observedRetryAfterAt(failure, failedAt);
+      if (requestedRetryAt && Number.isNaN(new Date(requestedRetryAt).getTime())) throw new Error('Failure next retry time must be valid');
+      item.next_retry_at = requestedRetryAt ? new Date(requestedRetryAt).toISOString() : nextRetryAt(item.last_failed_at, item.attempt_count);
     }
     return { ...item };
   }, options);
@@ -173,6 +199,28 @@ export async function resolveException({ dataRoot = getCareerOpsRoot(), key, evi
   }, { dataRoot, ...options });
 }
 
+/**
+ * Persist a reason that an otherwise eligible retry was not allowed to make a
+ * request.  This is deliberately separate from recordFailure(): a missing
+ * selector, permission hold, or host cooldown is not a failed attempt and
+ * must never consume the three-attempt recovery budget.
+ */
+export async function deferException({ dataRoot = getCareerOpsRoot(), key, reason, nextRetryAt: retryAt, evidence, ...options } = {}) {
+  if (!key) throw new Error('Exception key is required');
+  if (!reason) throw new Error('Exception deferral requires a reason');
+  if (!retryAt || Number.isNaN(new Date(retryAt).getTime())) throw new Error('Exception deferral requires a valid next retry time');
+  return updateStore(doc => {
+    const item = doc.items.find(value => value.key === key);
+    if (!item) throw new Error('Exception record not found');
+    if (!['retryable', 'needs_diagnosis'].includes(item.status)) return { ...item };
+    item.deferrals = [...(item.deferrals || []), {
+      deferred_at: new Date().toISOString(), reason: String(reason), next_retry_at: new Date(retryAt).toISOString(), evidence: evidence ?? null,
+    }];
+    if (item.status === 'retryable') item.next_retry_at = new Date(retryAt).toISOString();
+    return { ...item };
+  }, { dataRoot, ...options });
+}
+
 // Cross-file reconciliation deliberately takes this non-recursive lock order:
 // transition -> job queue -> exception store.  It writes a complete intent
 // before replacing any document, so a later invocation can finish an
@@ -192,6 +240,16 @@ function keyFor(queue, item) {
     const canonical = canonicalLeadUrl(url.join('|'));
     if (!canonical || !stage) throw new Error(`Invalid candidate exception key: ${key}`);
     return `candidate|${stage}|${canonical}`;
+  }
+  // v2 source keys are immutable attempt selectors.  Re-normalizing them as
+  // company-only legacy keys would collapse two boards or two original windows
+  // during queue reconciliation, defeating the reason they were introduced.
+  if (isSourceKey(key) && !key.startsWith('source|')) {
+    const source = parseSourceKey(key);
+    if (!source?.provider || !source.board_identifier || !/^\d{4}-\d{2}-\d{2}$/.test(source.window?.posted_after) || !/^\d{4}-\d{2}-\d{2}$/.test(source.window?.posted_before) || !source.type) {
+      throw new Error(`Invalid exact source exception key: ${key}`);
+    }
+    return key;
   }
   const [, rawCompany = '', kind = 'error'] = key.split('|');
   const evidence = item.origin_evidence || item.warning_evidence || item.evidence || {};

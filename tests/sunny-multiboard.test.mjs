@@ -139,6 +139,25 @@ test('backfill deadline is checked before claim and maxBoards bounds work', asyn
   assert.equal(readResolutionRows({ dataRoot }).filter(row => row.backfill_status === 'running').length, 0);
 });
 
+test('scope-bounded backfill only claims rows produced by that exact expansion scope', async t => {
+  const dataRoot = mkdtempSync(join(tmpdir(), 'sunny-scoped-backfill-'));
+  t.after(() => rmSync(dataRoot, { recursive: true, force: true }));
+  mkdirSync(join(dataRoot, 'profiles'));
+  writeFileSync(join(dataRoot, 'profiles/sunny-company-discovery.yml'), 'scan:\n  backfill_days: 20\n');
+  const rows = (await resolveCompanyLeads(args)).map((row, index) => ({
+    ...row, scope: index === 0 ? 'nyc' : 'remote', backfill_status: 'pending',
+  }));
+  await updateResolutionRows(rows, { dataRoot });
+  const scanned = [];
+  const result = await runPendingBackfills({ dataRoot, scope: 'nyc', now: args.now, ignoreGuard: true,
+    scan: async item => { scanned.push(item.boardIdentifier); return { completion_status: 'complete' }; } });
+  assert.equal(result.started, 1);
+  assert.deepEqual(scanned, [rows[0].board_identifier]);
+  const saved = readResolutionRows({ dataRoot });
+  assert.equal(saved.find(row => row.scope === 'nyc').backfill_status, 'complete');
+  assert.equal(saved.find(row => row.scope === 'remote').backfill_status, 'pending');
+});
+
 test('a deadline reached during a board leaves claimed rows safely retryable', async t => {
   const dataRoot = mkdtempSync(join(tmpdir(), 'sunny-backfill-interrupted-'));
   t.after(() => rmSync(dataRoot, { recursive: true, force: true }));

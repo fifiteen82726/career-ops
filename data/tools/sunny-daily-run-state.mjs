@@ -8,6 +8,7 @@ import { acquirePipelineLock } from '../../pipeline-lock.mjs';
 import { isMainModule } from '../../lib/is-main-module.mjs';
 import { canonicalLeadUrl } from './sunny-company-leads.mjs';
 import { refreshScanStatusSnapshot } from './build-sunny-scan-status.mjs';
+import { isSourceKey } from './sunny-source-identity.mjs';
 
 function file(dataRoot) { return join(dataRoot, 'data/sunny-daily-run-state.json'); }
 function historyFile(dataRoot, runId) { return join(dataRoot, 'data/company-discovery/daily-run-history', `${createHash('sha256').update(runId).digest('hex')}.json`); }
@@ -24,7 +25,7 @@ function durableCounts(dataRoot, now = new Date()) {
   const retryable = exceptions.filter(item => item.status === 'retryable');
   const due = item => item.next_retry_at && new Date(item.next_retry_at).getTime() <= nowAt;
   const candidate = retryable.filter(item => item.key.startsWith('candidate|'));
-  const source = retryable.filter(item => item.key.startsWith('source|'));
+  const source = retryable.filter(item => isSourceKey(item.key));
   const unacknowledged = exceptions.filter(item => item.status === 'needs_diagnosis' && !item.diagnosis_acknowledged);
   const acknowledged = exceptions.filter(item => item.status === 'needs_diagnosis' && item.diagnosis_acknowledged);
   return {
@@ -189,7 +190,10 @@ export async function reconcileRunState({ dataRoot = getCareerOpsRoot() } = {}) 
   return { reconciliation, exceptions, status: readRunStatus({ dataRoot }) };
 }
 const OPERATION_NAMES = ['date_tab', 'master', 'excluded', 'seen_jobs', 'scan_summary', 'archive', 'index', 'queue_disposition'];
-const TERMINAL_OUTCOMES = ['published', 'rejected', 'duplicate', 'closed', 'deferred'];
+// `resolved` is source-only: a complete exact-board receipt resolved the
+// source exception. Candidate dispositions deliberately retain their stricter
+// terminal vocabulary and payload requirements.
+const TERMINAL_OUTCOMES = ['published', 'rejected', 'duplicate', 'closed', 'resolved', 'deferred'];
 
 function validatePayload(payload, member) {
   if (!payload || typeof payload !== 'object') throw new Error('Checkpoint requires a saved payload');
@@ -225,7 +229,7 @@ function payloadDocument(dataRoot, batch) {
   return stored;
 }
 function exceptionFor(dataRoot, key) {
-  const name = String(key).startsWith('source|') ? 'sunny-scan-exception-queue.json' : 'sunny-job-exception-queue.json';
+  const name = isSourceKey(key) ? 'sunny-scan-exception-queue.json' : 'sunny-job-exception-queue.json';
   const path = join(dataRoot, 'data', name);
   const items = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')).items || [] : [];
   return items.find(item => item.key === key);

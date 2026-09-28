@@ -131,7 +131,9 @@ export async function enqueueScanReceipt(receipt, { dataRoot = getCareerOpsRoot(
       : { since_days: receipt.since_days }),
   };
   // Partial/error scans may still have real added URLs. Preserve them for evaluation.
-  const urls = [...new Set(receipt.scan_receipt.added_urls.map(raw => {
+  const intakeUrls = Array.isArray(receipt.scan_receipt.canonical_intake_urls)
+    ? receipt.scan_receipt.canonical_intake_urls : receipt.scan_receipt.added_urls;
+  const urls = [...new Set(intakeUrls.map(raw => {
     const parsed = new URL(raw);
     if (!['https:', 'http:'].includes(parsed.protocol)) throw new Error('Invalid job URL protocol');
     return canonicalLeadUrl(raw);

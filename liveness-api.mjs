@@ -191,6 +191,92 @@ const ATS_PROVIDERS = [
     },
   },
   {
+    id: 'icims',
+    // Public job detail; only the exact /jobs/<numeric-id>/.../job shape is
+    // accepted, never a board/search route whose 404 could close a candidate.
+    match(u) {
+      if (!/^[a-z0-9-]+\.icims\.com$/i.test(u.hostname)) return null;
+      if (!/^\/jobs\/\d+\/[^/]+\/job\/?$/i.test(u.pathname)) return null;
+      // `isSafeValue` accepts slash-separated values only when every segment
+      // is non-empty.  Store the path without its URL delimiter so the shared
+      // SSRF validation still applies to every real segment.
+      return { host: u.hostname, path: u.pathname.slice(1) };
+    },
+    api: ({ host, path }) => `https://${host}/${path}?in_iframe=1`,
+    api404Authoritative: false,
+    accept: 'text/html',
+    async interpret(res, { path }) {
+      let html;
+      try { html = await res.text(); } catch { return null; }
+      return classifyIcimsPosting(html, path.split('/')[1]);
+    },
+  },
+  {
+    id: 'oraclecloud',
+    // Oracle Recruiting Cloud uses the public requisition-detail resource.  The
+    // tenant and site come from the candidate's exact public URL; neither is
+    // guessed from a company name or a board response.
+    match(u) {
+      if (!/^[a-z0-9-]+\.fa\.(?:[a-z0-9-]+\.)?(?:ocs\.)?oraclecloud(?:[1-9][0-9]?)?\.com$/i.test(u.hostname)) return null;
+      const m = u.pathname.match(/^\/hcmUI\/CandidateExperience\/([a-z-]+)\/sites\/([^/]+)\/job\/([A-Za-z0-9_-]+)\/?$/);
+      return m ? { host: u.hostname, lang: m[1], site: m[2], requisition: m[3] } : null;
+    },
+    // ORC exposes public detail through its requisition finder rather than a
+    // REST `/id` resource.  `keyword` is the documented exact-requisition
+    // lookup used by the Candidate Experience UI; the fetcher still verifies
+    // the returned Id before accepting its description.
+    api: ({ host, site, requisition }) => `https://${host}/hcmRestApi/resources/latest/recruitingCEJobRequisitions?onlyData=true&expand=requisitionList.workLocation,requisitionList.secondaryLocations&finder=findReqs%3BsiteNumber=${site},keyword=${requisition},limit=1,offset=0&limit=1&offset=0`,
+    api404Authoritative: false,
+    async interpret(res, { requisition }) {
+      let json;
+      try { json = await res.json(); } catch { return null; }
+      const job = json?.items?.[0]?.requisitionList?.[0];
+      return job && String(job.Id ?? job.RequisitionNumber) === requisition
+        && typeof job.Title === 'string' && job.Title.trim()
+        ? { result: 'active', code: 'oraclecloud_exact_requisition', reason: 'Oracle finder returns the exact requisition' }
+        : { result: 'uncertain', code: 'oraclecloud_inconclusive_detail', reason: 'Oracle response does not prove this exact requisition' };
+    },
+  },
+  {
+    id: 'paylocity',
+    // Detail pages are official HTML.  A board URL is deliberately not a
+    // match: a board 404 says nothing about an individual candidate job.
+    match(u) {
+      if (u.hostname !== 'recruiting.paylocity.com') return null;
+      const m = u.pathname.match(/^\/recruiting\/Jobs\/Details\/([0-9]+)\/?$/i);
+      return m ? { id: m[1] } : null;
+    },
+    api: ({ id }) => `https://recruiting.paylocity.com/recruiting/Jobs/Details/${id}`,
+    accept: 'text/html',
+    api404Authoritative: false,
+    async interpret(res) {
+      let html; try { html = await res.text(); } catch { return null; }
+      return /job-listing-header[^>]*>\s*Description\s*</i.test(html)
+        ? { result: 'active', code: 'paylocity_detail_description', reason: 'Paylocity serves an official job Description region' }
+        : { result: 'uncertain', code: 'paylocity_inconclusive_html', reason: 'Paylocity response is not a recognised job detail page' };
+    },
+  },
+  {
+    id: 'ey',
+    // EY's public detail page is the authoritative source for this observed
+    // SAP-hosted shape.  Restricting the matcher to the detail route avoids
+    // treating its search and consent pages as job records.
+    match(u) {
+      if (u.hostname !== 'careers.ey.com') return null;
+      const m = u.pathname.match(/^\/ey\/job\/[^/]+\/([0-9]+)\/?$/i);
+      return m ? { id: m[1] } : null;
+    },
+    api: ({ id }) => `https://careers.ey.com/ey/job/_/${id}/`,
+    accept: 'text/html',
+    api404Authoritative: false,
+    async interpret(res) {
+      let html; try { html = await res.text(); } catch { return null; }
+      return /itemprop=["']description["']/i.test(html) && /itemtype=["']https?:\/\/schema\.org\/JobPosting["']/i.test(html)
+        ? { result: 'active', code: 'ey_jobposting_microdata', reason: 'EY serves official JobPosting microdata' }
+        : { result: 'uncertain', code: 'ey_inconclusive_html', reason: 'EY response is not a recognised job detail page' };
+    },
+  },
+  {
     id: 'arbeitsagentur',
     match(u) {
       if (u.hostname !== 'www.arbeitsagentur.de') return null;
@@ -318,6 +404,24 @@ export function classifyLinkedInPosting(html) {
   };
 }
 
+/**
+ * iCIMS serves HTTP 200 for its application shell, authentication wall, and
+ * occasionally for an unavailable job.  A status code alone therefore says
+ * nothing about this exact job.  We only conclude from an actual JobPosting,
+ * or from an explicit unavailable marker tied to the numeric job id.
+ */
+export function classifyIcimsPosting(html, jobId) {
+  if (typeof html !== 'string' || !html.trim() || !/^\d+$/.test(String(jobId))) return null;
+  const id = String(jobId);
+  const jsonLd = /"@type"\s*:\s*"JobPosting"/i.test(html);
+  const explicitId = new RegExp(`(?:job|req(?:uisition)?|position)\\s*(?:id|number|#)?\\s*[:#]?\\s*${id}\\b`, 'i').test(html);
+  const unavailable = /(?:job|position|opportunity)\s+(?:is\s+)?(?:no longer available|not available|has been filled|closed)/i.test(html);
+  const apply = /(?:apply now|apply for this job|submit application)/i.test(html);
+  if (jsonLd && !unavailable) return { result: 'active', code: 'icims_jobposting', reason: 'iCIMS returns an official JobPosting document' };
+  if (explicitId && unavailable && !apply) return { result: 'expired', code: 'icims_job_unavailable', reason: 'iCIMS identifies this job as unavailable' };
+  return { result: 'uncertain', code: 'icims_inconclusive_html', reason: 'iCIMS response does not prove this job is live or expired' };
+}
+
 // Reserved send times per provider, so back-to-back callers queue behind each
 // other instead of all reading the same "last request" timestamp and firing
 // together.
@@ -414,7 +518,9 @@ export function isAtsPosting(url) {
 // for liveness only — their public endpoints answer search/status, never body
 // text — so they are deliberately excluded here; see fetch-jd.mjs / the
 // fetch*Jd() family in browser-extract.mjs for the per-provider fetchers.
-export const JD_TEXT_API_ATS = new Set(['greenhouse', 'lever', 'ashby', 'workday']);
+// SmartRecruiters' posting-detail API has the same property and its section
+// parser is shared with the scanner provider.
+export const JD_TEXT_API_ATS = new Set(['greenhouse', 'greenhouse-embedded', 'lever', 'ashby', 'workday', 'smartrecruiters', 'icims', 'oraclecloud', 'paylocity', 'ey']);
 
 /**
  * Zero-token liveness check via the posting's ATS API.

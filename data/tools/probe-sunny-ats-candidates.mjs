@@ -9,8 +9,8 @@ import { getCareerOpsRoot } from '../../path-resolver.mjs';
 import { acquirePipelineLock } from '../../pipeline-lock.mjs';
 import { loadProviders, resolveProvider } from '../../providers/_registry.mjs';
 import { normalizeCompanyIdentity, providerCoordinates, verifyCandidate } from './build-sunny-h1b-ats-universe.mjs';
-import { loadTsv, loadDolEvidence, joinLeadToDol, evaluateAtsCandidate, portalBoardKey, portalEntryBoardKey,
-  isScannableAdmission, commitPortalAdmissions, commitPortalRepairs, recordPortalCommitFailure, writeJsonReceipt } from './sunny-company-expansion.mjs';
+import { loadTsv, loadDolEvidence, joinLeadToDol, evaluateAtsCandidate, isEnvironmentOnlyTransportFailure, portalBoardKey, portalEntryBoardKey,
+  isScannableAdmission, commitPortalAdmissions, commitPortalRepairs, commitPortalRepairsWithBackfill, recordPortalCommitFailure, writeJsonReceipt } from './sunny-company-expansion.mjs';
 import { readResolutionRows, updateResolutionRows, statePaths, startBackfill, nextRetryAt } from './sunny-company-state.mjs';
 
 const OWNERS = new Set(['greenhouse', 'ashby', 'lever', 'workday']);
@@ -74,7 +74,11 @@ export async function probeCandidates(candidates, { employers, now = new Date(),
           row = { ...row, ...evaluated, preferred_name: row.preferred_name, normalized_lead: row.normalized_lead };
         }
       } catch (error) {
-        row = { ...row, status: 'verification_error', health_status: 'error', reason: String(error.message || error) };
+        const reason = String(error.message || error);
+        row = isEnvironmentOnlyTransportFailure(error)
+          ? { ...row, status: 'environment_unavailable', health_status: 'environment_unavailable',
+            identity_status: 'environment_unavailable', environment_only: true, last_attempt_at: '', reason }
+          : { ...row, status: 'verification_error', health_status: 'error', reason };
       }
       const hold = identityHolds.find(item => key(item) === key(row)
         && String(item.dol_legal_name).trim() === row.dol_legal_name);
@@ -83,7 +87,8 @@ export async function probeCandidates(candidates, { employers, now = new Date(),
         evidence: JSON.stringify({ kind: 'configured-identity-hold', evidence_urls: hold.evidence_urls,
           current_verification: row.evidence || '' }) };
       if (isScannableAdmission(row)) row = { ...startBackfill(row, now, 20), backfill_status: 'pending', backfill_attempted_at: '' };
-      else row.next_retry_at = nextRetryAt(now, row.status === 'verification_error' ? { minutes: 180 } : { days: 7 });
+      else row.next_retry_at = row.environment_only ? ''
+        : nextRetryAt(now, row.status === 'verification_error' ? { minutes: 180 } : { days: 7 });
       results[index] = row;
     }
   }));
@@ -109,7 +114,8 @@ export function planProbeAdmissions(rows, portals, routable) {
     if (matches.length === 1 && !usedTargets.has(matches[0].name)) {
       usedTargets.add(matches[0].name);
       repairs.push({ target_name: matches[0].name, expected_careers_url: matches[0].careers_url,
-        official_evidence_url: row.careers_url, admission: row });
+        official_evidence_url: row.careers_url, admission: row,
+        ...(row.repair_origin ? { origin: row.repair_origin } : {}) });
     } else additions.push(row);
   }
   return { additions, repairs, reviews };
@@ -141,7 +147,12 @@ export async function runProbe({ dataRoot = getCareerOpsRoot(), scope = 'remote'
     if (write) {
       await updateResolutionRows(outcomes, { dataRoot });
       try {
-        receipt.repaired = (await commitPortalRepairs(plan.repairs, { dataRoot })).updated;
+        const anchoredRepairs = plan.repairs.filter(repair => repair.origin);
+        const ordinaryRepairs = plan.repairs.filter(repair => !repair.origin);
+        const anchored = await commitPortalRepairsWithBackfill(anchoredRepairs, { dataRoot });
+        const ordinary = await commitPortalRepairs(ordinaryRepairs, { dataRoot });
+        receipt.repaired = anchored.updated + ordinary.updated;
+        receipt.repair_backfills_queued = anchored.queued;
         receipt.added = (await commitPortalAdmissions(plan.additions, { dataRoot })).added;
       } catch (error) {
         await recordPortalCommitFailure(outcomes, error, { dataRoot });

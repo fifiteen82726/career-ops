@@ -119,6 +119,17 @@ test('returns due retryable exceptions in retry order only when normal work is e
   assert.deepEqual(plan.diagnoses_due.map(item => item.key), ['source|diagnose|transient']);
 });
 
+test('selects a due run-aware source retry through the real planner', async t => {
+  const dataRoot = root(t);
+  await recordFailure({
+    key: 'source-v3|daily-origin|workday|tenant%7CExternal|2026-09-20|2026-09-23|transient', queue: 'source', stage: 'scan',
+    message: 'HTTP 503', failed_at: '2026-09-20T12:00:00.000Z',
+  }, { dataRoot, queue: 'source' });
+  const plan = await buildDailyWorkPlan({ dataRoot, runScan: false, now: new Date('2026-09-23T12:00:00.000Z') });
+  assert.equal(plan.batch.type, 'source_retry');
+  assert.deepEqual(plan.batch.members, ['source-v3|daily-origin|workday|tenant%7CExternal|2026-09-20|2026-09-23|transient']);
+});
+
 test('a partial scan keeps valid normal URLs while recording source exception evidence', async t => {
   const dataRoot = root(t);
   const url = 'https://example.com/jobs/from-partial-scan';

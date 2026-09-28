@@ -118,6 +118,25 @@ function dedupe(rows) {
   return out;
 }
 
+// Keep the public collector API as an array while carrying bounded-progress
+// evidence for the routine. The property is deliberately non-enumerable so
+// direct CLI JSON output and existing array consumers cannot mistake it for a
+// job row.
+function partialRows(rows, { error, pageCount, queryCount, continuation }) {
+  const result = dedupe(rows);
+  Object.defineProperty(result, 'collection', {
+    value: Object.freeze({
+      status: 'partial',
+      error: clean(error),
+      page_count: pageCount,
+      query_count: queryCount,
+      continuation,
+    }),
+    enumerable: false,
+  });
+  return result;
+}
+
 export function freehireSearchUrl({
   scope, offset = 0, limit = 100, mode = 'incremental', purpose = 'jobs',
 } = {}) {
@@ -186,21 +205,33 @@ export async function collectFreehireLeads({
   pageSize = 100,
   maxPages = mode === 'backfill' ? 100 : 5,
   requestJson = defaultRequestJson,
+  continuation = null,
 } = {}) {
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) throw new Error('pageSize must be 1..100');
   if (!Number.isInteger(maxPages) || maxPages < 1 || maxPages > 100) throw new Error('maxPages must be 1..100');
   const rows = [];
-  let offset = 0;
+  let offset = Number.isInteger(continuation?.offset) && continuation.offset >= 0 ? continuation.offset : 0;
+  let pages = 0;
   for (let page = 0; page < maxPages; page += 1) {
-    const payload = await requestJson(freehireSearchUrl({ scope, offset, limit: pageSize, mode, purpose }));
-    if (!payload || !Array.isArray(payload.data)) throw new Error('freehire: expected a data array');
-    const ignored = payload.meta?.ignored_params;
-    if (Array.isArray(ignored) && ignored.length) throw new Error(`freehire ignored filters: ${ignored.join(', ')}`);
+    let payload;
+    try {
+      payload = await requestJson(freehireSearchUrl({ scope, offset, limit: pageSize, mode, purpose }));
+      if (!payload || !Array.isArray(payload.data)) throw new Error('freehire: expected a data array');
+      const ignored = payload.meta?.ignored_params;
+      if (Array.isArray(ignored) && ignored.length) throw new Error(`freehire ignored filters: ${ignored.join(', ')}`);
+    } catch (error) {
+      if (!pages) throw error;
+      return partialRows(rows, { error, pageCount: pages, queryCount: 1,
+        continuation: { offset, page, purpose } });
+    }
     rows.push(...payload.data.map(normalizeFreehireRow).filter(Boolean));
+    pages += 1;
     const returned = payload.data.length;
     const total = Number(payload.meta?.total ?? returned);
     offset += returned;
     if (!returned || offset >= total) break;
+    if (page + 1 === maxPages) return partialRows(rows, { error: 'page budget exhausted', pageCount: pages, queryCount: 1,
+      continuation: { offset, page: page + 1, purpose } });
   }
   return dedupe(rows);
 }
@@ -283,6 +314,7 @@ export async function collectHimalayasLeads({
     throw new Error('maxPagesPerQuery must be 1..25');
   }
   const rows = [];
+  let pages = 0;
   for (const query of queries) {
     for (let page = 1; page <= maxPagesPerQuery; page += 1) {
       const url = new URL(HIMALAYAS_API);
@@ -290,13 +322,21 @@ export async function collectHimalayasLeads({
       url.searchParams.set('country', 'US');
       url.searchParams.set('sort', 'recent');
       url.searchParams.set('page', String(page));
-      const payload = await requestJson(url.href);
-      if (!payload || !Array.isArray(payload.jobs)) throw new Error('himalayas: expected a jobs array');
+      let payload;
+      try {
+        payload = await requestJson(url.href);
+        if (!payload || !Array.isArray(payload.jobs)) throw new Error('himalayas: expected a jobs array');
+      } catch (error) {
+        if (!pages) throw error;
+        return partialRows(rows, { error, pageCount: pages, queryCount: queries.indexOf(query) + 1,
+          continuation: { query, page } });
+      }
       rows.push(...parseHimalayasResponse(payload).map(row => ({
         ...row,
         posted_at: iso(row.postedAt),
         ats_source: 'himalayas',
       })));
+      pages += 1;
       const limit = Number(payload.limit || 20);
       const total = Number(payload.totalCount ?? payload.jobs.length);
       if (!payload.jobs.length || page * limit >= total) break;
@@ -404,25 +444,41 @@ export async function collectNewgradJobsLeads({
   }
 
   const rows = [];
+  let pages = 0;
   for (const category of categories) {
     const pageUrl = `${JOBRIGHT_BASE}/minisites-jobs/newgrad/us/${category}?embed=true`;
-    const first = parseNewgradJobsPage(await requestText(pageUrl), category);
+    let first;
+    try {
+      first = parseNewgradJobsPage(await requestText(pageUrl), category);
+    } catch (error) {
+      if (!pages) throw error;
+      return partialRows(rows, { error, pageCount: pages, queryCount: categories.indexOf(category) + 1,
+        continuation: { category, position: 0 } });
+    }
     rows.push(...first.jobs.map(normalizeNewgradJob).filter(Boolean));
+    pages += 1;
     let position = first.jobs.length;
     for (let page = 1; page < maxPagesPerCategory && position < first.total; page += 1) {
       const url = new URL(JOBRIGHT_LIST_API);
       url.searchParams.set('position', String(position));
       url.searchParams.set('count', String(pageSize));
-      const payload = await requestJson(url.href, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', accept: 'application/json' },
-        body: JSON.stringify({ category: `newgrad:us:${category}` }),
-      });
-      if (payload?.success !== true || !Array.isArray(payload?.result?.jobList)) {
-        throw new Error(`newgrad-jobs: malformed list response for ${category}`);
+      let payload;
+      try {
+        payload = await requestJson(url.href, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', accept: 'application/json' },
+          body: JSON.stringify({ category: `newgrad:us:${category}` }),
+        });
+        if (payload?.success !== true || !Array.isArray(payload?.result?.jobList)) {
+          throw new Error(`newgrad-jobs: malformed list response for ${category}`);
+        }
+      } catch (error) {
+        return partialRows(rows, { error, pageCount: pages, queryCount: categories.indexOf(category) + 1,
+          continuation: { category, position } });
       }
       const batch = payload.result.jobList;
       rows.push(...batch.map(normalizeNewgradJob).filter(Boolean));
+      pages += 1;
       if (!batch.length) break;
       position += batch.length;
       const total = Number(payload.result.total);
@@ -436,17 +492,27 @@ export async function collectTheMuseLeads({
   scope,
   maxPages = 100,
   requestJson = defaultRequestJson,
+  continuation = null,
 } = {}) {
   if (!['nyc', 'remote'].includes(scope)) throw new Error('scope must be nyc or remote');
   if (!Number.isInteger(maxPages) || maxPages < 1 || maxPages > 100) throw new Error('maxPages must be 1..100');
   const rows = [];
-  let pageCount = 1;
-  for (let page = 0; page < Math.min(pageCount, maxPages); page += 1) {
+  const startPage = Number.isInteger(continuation?.page) && continuation.page >= 0 ? continuation.page : 0;
+  let pageCount = Infinity;
+  let pages = 0;
+  for (let page = startPage; page < pageCount && pages < maxPages; page += 1) {
     const url = new URL(THEMUSE_API);
     url.searchParams.set('page', String(page));
-    const payload = await requestJson(url.href);
-    if (!payload || !Array.isArray(payload.results)) throw new Error(`The Muse: expected results array on page ${page}`);
-    if (page === 0) pageCount = Math.max(1, Number(payload.page_count) || 1);
+    let payload;
+    try {
+      payload = await requestJson(url.href);
+      if (!payload || !Array.isArray(payload.results)) throw new Error(`The Muse: expected results array on page ${page}`);
+    } catch (error) {
+      if (!pages) throw error;
+      return partialRows(rows, { error, pageCount: pages, queryCount: 1, continuation: { page } });
+    }
+    pageCount = Math.max(pageCount === Infinity ? 1 : pageCount, Number(payload.page_count) || 1);
+    pages += 1;
     for (const job of payload.results) {
       const company = clean(job?.company?.name);
       const title = clean(job?.name);
@@ -468,6 +534,8 @@ export async function collectTheMuseLeads({
       });
     }
   }
+  if (startPage + pages < pageCount) return partialRows(rows, { error: 'page budget exhausted', pageCount: pages, queryCount: 1,
+    continuation: { page: startPage + pages } });
   return dedupe(rows);
 }
 

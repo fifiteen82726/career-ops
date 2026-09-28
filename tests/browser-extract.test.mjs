@@ -15,7 +15,7 @@ try {
   const {
     resolveExtractorMode, compactText, normalizeJd, normalizeListing, parseArgs,
     workdayCxsUrl, jdHtmlToText, normalizeWorkdayJob,
-    normalizeAshbyJob, normalizeGreenhouseJob, normalizeLeverJob,
+    normalizeAshbyJob, normalizeGreenhouseJob, normalizeLeverJob, normalizeSmartRecruitersJob, normalizeIcimsJobPosting,
     fetchJdViaKnownApi, JD_FETCHERS,
   } = mod;
 
@@ -229,6 +229,14 @@ try {
   );
   if (wdCapped && wdCapped.text.length <= 501) pass('normalizeWorkdayJob honors the text cap');
   else fail(`normalizeWorkdayJob cap => ${wdCapped && wdCapped.text.length}`);
+
+  const smart = normalizeSmartRecruitersJob({ id: 'abc-1', name: 'Data Engineer', location: { fullLocation: 'New York, NY' }, jobAd: { sections: { jobDescription: { text: '<p>Build reliable data systems.</p>' }, qualifications: { text: '<p>SQL experience.</p>' } } } }, 'https://jobs.smartrecruiters.com/acme/abc-1-data-engineer');
+  if (smart?.title === 'Data Engineer' && smart.text.includes('Location: New York, NY') && smart.text.includes('Build reliable data systems.') && smart.text.includes('SQL experience.')) pass('normalizeSmartRecruitersJob reuses official detail sections');
+  else fail(`normalizeSmartRecruitersJob => ${JSON.stringify(smart)}`);
+
+  const icims = normalizeIcimsJobPosting('<script type="application/ld+json">{"@type":"JobPosting","title":"Analytics Engineer","description":"<p>Own data models and pipelines.</p>","jobLocation":{"address":{"addressLocality":"New York","addressRegion":"NY","addressCountry":"US"}}}</script>', 'https://careers-acme.icims.com/jobs/42/analytics-engineer/job');
+  if (icims?.title === 'Analytics Engineer' && icims.text.includes('Location: New York, NY, US') && icims.text.includes('Own data models and pipelines.')) pass('normalizeIcimsJobPosting accepts substantive official JobPosting JSON-LD');
+  else fail(`normalizeIcimsJobPosting => ${JSON.stringify(icims)}`);
 
   // normalizeAshbyJob — Ashby's public API is ORG-level, so the job is picked
   // out of the whole board by a case-insensitive id compare.

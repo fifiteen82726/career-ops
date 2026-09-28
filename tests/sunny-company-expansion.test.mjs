@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import * as yaml from 'js-yaml';
 import * as expansion from '../data/tools/sunny-company-expansion.mjs';
+import { statePaths } from '../data/tools/sunny-company-state.mjs';
 
 import {
   commitPortalAdmissions,
@@ -17,9 +18,55 @@ import {
   parseArgs,
   portalBoardKey,
   portalEntryBoardKey,
+  runResolution,
   resolveCompanyLeads,
   validateV2Review,
+  writeResolutionFailureReceipt,
 } from '../data/tools/sunny-company-expansion.mjs';
+
+test('resolver CAS failure gets its own terminal receipt', t => {
+  const dataRoot = mkdtempSync(join(tmpdir(), 'sunny-resolver-cas-receipt-'));
+  t.after(() => rmSync(dataRoot, { recursive: true, force: true }));
+  const receiptPath = writeResolutionFailureReceipt(statePaths(dataRoot), {
+    scope: 'nyc', mode: 'incremental', maxBoards: 1,
+    deadlineAt: new Date('2026-09-28T05:00:00Z'),
+    error: new Error('portals.yml changed during 3 consecutive CAS attempts'),
+    now: new Date('2026-09-28T04:00:00Z'),
+  });
+  const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'));
+  assert.equal(receipt.command, 'resolve');
+  assert.equal(receipt.status, 'error');
+  assert.equal(receipt.scope, 'nyc');
+  assert.equal(receipt.max_boards, 1);
+  assert.match(receipt.error.message, /CAS attempts/);
+});
+
+test('runResolution writes its own terminal receipt when portal CAS commit throws', async t => {
+  const dataRoot = mkdtempSync(join(tmpdir(), 'sunny-resolver-cas-branch-'));
+  t.after(() => rmSync(dataRoot, { recursive: true, force: true }));
+  mkdirSync(join(dataRoot, 'profiles'), { recursive: true });
+  mkdirSync(join(dataRoot, 'data'), { recursive: true });
+  writeFileSync(join(dataRoot, 'profiles/sunny-company-discovery.yml'), yaml.dump({
+    dol_employers: 'data/employers.tsv', ats_candidates: 'data/candidates.tsv',
+  }), 'utf8');
+  writeFileSync(join(dataRoot, 'profiles/sunny-company-identity-reviews-v2.yml'), 'schema_version: 2\nreviews: []\n');
+  writeFileSync(join(dataRoot, 'profiles/sunny-h1b-ats-identity-reviews.yml'), 'reviews: []\n');
+  writeFileSync(join(dataRoot, 'data/employers.tsv'), 'EMPLOYER_NAME\n');
+  writeFileSync(join(dataRoot, 'data/candidates.tsv'), 'provider\tidentifier\n');
+  writeFileSync(join(dataRoot, 'portals.yml'), 'tracked_companies: []\n');
+  await assert.rejects(
+    runResolution({
+      dataRoot, scope: 'nyc', write: true, maxBoards: 1,
+      deadlineAt: new Date('2026-09-28T05:00:00Z'), now: new Date('2026-09-28T04:00:00Z'),
+      commitAdmissions: async () => { throw new Error('portals.yml changed during 3 consecutive CAS attempts'); },
+    }),
+    error => {
+      assert.ok(error.receipt_path);
+      const receipt = JSON.parse(readFileSync(error.receipt_path, 'utf8'));
+      return receipt.command === 'resolve' && receipt.status === 'error' && /CAS attempts/.test(receipt.error.message);
+    },
+  );
+});
 
 test('default fetch context forwards POST options needed by Workday CXS', async t => {
   const originalFetch = globalThis.fetch;
@@ -137,6 +184,25 @@ test('company lead ingestion accepts replacement dashboards and rejects LinkedIn
     () => parseArgs(['ingest', '--source', 'linkedin', '--scope', 'remote', '--input', 'leads.json']),
     /supported source/,
   );
+});
+
+test('resolution stops official candidate checks at the board budget and leaves later leads resumable', async () => {
+  const leads = ['One', 'Two'].map((company, index) => ({
+    scope: 'nyc', source_company: company, normalized_source_company: company.toLowerCase(),
+    job_title: 'Data Engineer', job_url: `https://job-boards.greenhouse.io/${company.toLowerCase()}/jobs/${index + 1}`,
+    discovered_at: '2026-09-09T10:00:00Z', posted_at: '', source: 'builtin',
+  }));
+  const employersForBudget = ['One', 'Two'].map(company => ({ EMPLOYER_NAME: company, transfer_positions: '1' }));
+  let checked = 0;
+  const rows = await resolveCompanyLeads({ leads, scope: 'nyc', employers: employersForBudget, candidates: [], portals: { tracked_companies: [] },
+    maxBoards: 1, concurrency: 1, evaluateCandidate: async (dol, candidate) => {
+      checked += 1;
+      return { status: 'accepted', provider: candidate.provider, board_identifier: candidate.identifier,
+        careers_url: candidate.careers_url, health_status: 'live', identity_status: 'owner_verified', ...dol };
+    } });
+  assert.equal(checked, 1);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].normalized_lead, 'one');
 });
 
 const employers = [{

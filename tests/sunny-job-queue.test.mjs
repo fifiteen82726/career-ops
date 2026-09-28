@@ -40,6 +40,16 @@ test('morning backfill survives zero-result noon scan and receipt replay', async
   assert.equal(pending[0].sources[0].kind, 'backfill');
 });
 
+test('replayed continuation candidates enter canonical intake after scanner history already has them', async t => {
+  const dataRoot = root(t);
+  writeFileSync(join(dataRoot, 'data/sunny-scan-history.tsv'),
+    `url\tfirst_seen\ttitle\tcompany\tstatus\tposted_at\n${url}\t2026-09-08\tData Engineer\tExample\tadded\t2026-09-01\n`);
+  await queue.enqueueScanReceipt({ ...receipt, run_id: 'continuation-replay', scan_receipt: {
+    ...receipt.scan_receipt, added_urls: [], canonical_intake_urls: [url],
+  } }, { dataRoot });
+  assert.deepEqual(queue.readPendingJobs({ dataRoot }).map(job => job.url), [url]);
+});
+
 test('reconciles legacy percent-escape duplicate queue rows without losing sources', async t => {
   const dataRoot = root(t);
   writeFileSync(join(dataRoot, 'data/sunny-job-queue.json'), JSON.stringify({ schema_version: 1, jobs: [
@@ -337,7 +347,7 @@ test('a resolved publication-stage replay reports its persisted non-pending job 
 test('resolving a closed candidate exception twice never reopens the confirmed-closed job', async t => {
   const dataRoot = root(t);
   await queue.enqueueScanReceipt(receipt, { dataRoot });
-  await deferCandidateFailure({ url, stage: 'jd', message: 'HTTP 404 job no longer available' }, { dataRoot });
+  await deferCandidateFailure({ url, stage: 'jd', message: 'HTTP 404 job no longer available', evidence: { authoritative_expiry: true, official_url: url, source_code: 'greenhouse_api_gone' } }, { dataRoot });
 
   const first = await resolveCandidateException({ url, stage: 'jd' }, { dataRoot });
   const second = await resolveCandidateException({ url, stage: 'jd' }, { dataRoot });
@@ -359,7 +369,7 @@ test('a later closed failure replaces an earlier resolved retryable outcome', as
   }, { dataRoot });
   await resolveCandidateException({ url, stage: 'jd' }, { dataRoot });
   await deferCandidateFailure({
-    url, stage: 'jd', message: 'HTTP 404 job no longer available', failed_at: '2026-09-24T12:00:00.000Z',
+    url, stage: 'jd', message: 'HTTP 404 job no longer available', evidence: { authoritative_expiry: true, official_url: url, source_code: 'greenhouse_api_gone' }, failed_at: '2026-09-24T12:00:00.000Z',
   }, { dataRoot });
 
   await resolveCandidateException({ url, stage: 'jd' }, { dataRoot });
@@ -415,7 +425,7 @@ test('verified publication and official expiry terminalize the linked exception 
   assert.equal(JSON.parse(readFileSync(join(dataRoot, 'data/sunny-job-queue.json'))).jobs[0].status, 'published');
   const closedUrl = 'https://example.com/closed-outcome';
   await queue.enqueueScanReceipt({ ...receipt, run_id: 'backfill-2', scan_receipt: { ...receipt.scan_receipt, added_urls: [closedUrl] } }, { dataRoot });
-  await applyCandidateOutcome({ outcome: 'failure', url: closedUrl, stage: 'jd', attempt_id: 'closed-1', attempt_at: '2026-09-01T00:00:00.000Z', message: 'official HTTP 404 job no longer available' }, { dataRoot });
+  await applyCandidateOutcome({ outcome: 'failure', url: closedUrl, stage: 'jd', attempt_id: 'closed-1', attempt_at: '2026-09-01T00:00:00.000Z', message: 'official HTTP 404 job no longer available', evidence: { authoritative_expiry: true, official_url: closedUrl, source_code: 'greenhouse_api_gone' } }, { dataRoot });
   assert.equal(JSON.parse(readFileSync(join(dataRoot, 'data/sunny-job-queue.json'))).jobs.find(job => job.url === closedUrl).status, 'closed');
 });
 
@@ -450,7 +460,7 @@ test('a later official expiry closes an already-linked candidate exception and p
   await queue.enqueueScanReceipt(receipt, { dataRoot });
   const key = `candidate|jd|${url}`;
   await applyCandidateOutcome({ outcome: 'failure', url, stage: 'jd', attempt_id: 'first', attempt_at: '2026-09-01T00:00:00.000Z', message: 'HTTP 503' }, { dataRoot });
-  await applyCandidateOutcome({ outcome: 'failure', url, stage: 'jd', attempt_id: 'expired', attempt_at: '2026-09-02T00:00:00.000Z', message: 'official HTTP 404 job no longer available' }, { dataRoot });
+  await applyCandidateOutcome({ outcome: 'failure', url, stage: 'jd', attempt_id: 'expired', attempt_at: '2026-09-02T00:00:00.000Z', message: 'official HTTP 404 job no longer available', evidence: { authoritative_expiry: true, official_url: url, source_code: 'greenhouse_api_gone' } }, { dataRoot });
   const job = JSON.parse(readFileSync(join(dataRoot, 'data/sunny-job-queue.json'), 'utf8')).jobs[0];
   assert.equal(job.status, 'closed');
   const item = readExceptionQueue({ dataRoot, queue: 'candidate' }).find(value => value.key === key);

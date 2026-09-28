@@ -12,6 +12,30 @@ import { providerFetchContext } from './_ip-guard.mjs';
 export { BROWSER_LIKE_USER_AGENT, MACOS_BROWSER_LIKE_USER_AGENT };
 
 const DEFAULT_TIMEOUT_MS = 10_000;
+// Process-wide because one scan process concurrently fetches many boards.
+// The serialized Sunny wrapper opts in through CAREER_OPS_SUNNY_HOST_SPACING_MS;
+// unrelated provider consumers keep their existing timing contract.
+const HOST_NEXT_ALLOWED = new Map();
+
+function hostFor(url) { try { return new URL(url).host.toLowerCase(); } catch { return ''; } }
+export function resetHostPacing() { HOST_NEXT_ALLOWED.clear(); }
+export function hostCooldownUntil(url) { return HOST_NEXT_ALLOWED.get(hostFor(url)) || null; }
+async function respectHostPacing(url, opts) {
+  const spacing = Number(opts.hostSpacingMs ?? process.env.CAREER_OPS_SUNNY_HOST_SPACING_MS ?? 0);
+  if (!Number.isFinite(spacing) || spacing <= 0) return;
+  const host = hostFor(url); if (!host) return;
+  const now = Date.now(); const eligible = HOST_NEXT_ALLOWED.get(host) || now;
+  const wait = Math.max(0, eligible - now);
+  const deadline = opts.deadlineAt ? Date.parse(opts.deadlineAt) : NaN;
+  if (wait && Number.isFinite(deadline) && now + wait > deadline) {
+    const error = new Error(`host cooldown exceeds scan budget for ${host}`);
+    error.code = 'SUNNY_HOST_COOLDOWN_DEFERRED'; error.next_retry_at = new Date(eligible).toISOString();
+    throw error;
+  }
+  if (wait) await sleep(wait, opts);
+  // Reserve before dispatch so concurrent provider calls cannot bunch up.
+  HOST_NEXT_ALLOWED.set(host, Date.now() + spacing);
+}
 
 async function fetchWithTimeout(url, opts = {}, consume) {
   // Mark this request as provider traffic for the whole of its async life, so
@@ -27,10 +51,12 @@ async function fetchWithTimeout(url, opts = {}, consume) {
   return providerFetchContext.run({ url: String(url) }, () => fetchInContext(url, opts, consume));
 }
 
-async function fetchInContext(url, { timeoutMs = DEFAULT_TIMEOUT_MS, headers = {}, method = 'GET', body = null, redirect = 'follow', onResponse } = {}, consume) {
+async function fetchInContext(url, opts = {}, consume) {
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, headers = {}, method = 'GET', body = null, redirect = 'follow', onResponse } = opts;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
+    await respectHostPacing(url, opts);
     // Defaults go through Headers so a caller's override wins whatever its
     // capitalization. An object spread only replaces an identical key: a caller's
     // 'User-Agent' sat beside the default 'user-agent', and fetch JOINED the two
@@ -63,6 +89,11 @@ async function fetchInContext(url, { timeoutMs = DEFAULT_TIMEOUT_MS, headers = {
       err.status = res.status;
       err.body = responseText;
       err.retryAfter = res.headers.get('retry-after');
+      const retryAfterMs = parseRetryAfterMs(err.retryAfter);
+      if (retryAfterMs !== null) {
+        const host = hostFor(url);
+        if (host) HOST_NEXT_ALLOWED.set(host, Date.now() + retryAfterMs);
+      }
       // Only ever populated under redirect:'manual', where the 3xx arrives as a
       // non-ok response instead of being followed or thrown. Attached so a
       // caller can tell WHICH redirect it hit without gaining the ability to
@@ -344,12 +375,15 @@ export function makeHttpCtx(observer) {
   for (const method of ['fetchJson', 'fetchText', 'fetchResponse']) {
     const original = ctx[method];
     ctx[method] = (url, opts = {}) => {
-      observer.onRequest?.();
+      // Callers with an overall routine budget can cap every provider request
+      // here, including providers that paginate internally (Built In).
+      const bounded = observer.requestOptions?.(String(url), opts) || opts;
+      observer.onRequest?.(String(url));
       return original(url, {
-        ...opts,
+        ...bounded,
         onResponse: response => {
           opts.onResponse?.(response);
-          observer.onResponse?.(response.status);
+          observer.onResponse?.(response.status, response.url || String(url), response.headers);
         },
       });
     };

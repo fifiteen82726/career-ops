@@ -131,6 +131,70 @@ test('freehire collector pages, keeps direct ATS rows and drops aggregators incl
   assert.equal(rows[0].posted_at, '2026-09-09T12:00:00.000Z');
 });
 
+test('dashboard collectors retain completed pages and expose resumable partial evidence after a later failure', async () => {
+  const freehire = await collectFreehireLeads({
+    scope: 'remote', mode: 'backfill', pageSize: 1, maxPages: 2,
+    requestJson: async url => {
+      if (new URL(url).searchParams.get('offset') === '0') return {
+        data: [{ company: 'Acme', title: 'Data Engineer', location: 'Remote',
+          url: 'https://boards.greenhouse.io/acme/jobs/1', source: 'greenhouse' }], meta: { total: 2 },
+      };
+      throw new Error('fixture later page failed');
+    },
+  });
+  assert.deepEqual(freehire.map(row => row.company), ['Acme']);
+  assert.equal(freehire.collection.status, 'partial');
+  assert.equal(freehire.collection.page_count, 1);
+  assert.equal(freehire.collection.continuation.offset, 1);
+
+  const himalayas = await collectHimalayasLeads({
+    scope: 'remote', queries: ['data', 'analytics'], maxPagesPerQuery: 1,
+    requestJson: async url => {
+      if (new URL(url).searchParams.get('q') === 'data') return { jobs: [{ companyName: 'Acme', title: 'Data Engineer',
+        locationRestrictions: ['United States'], applicationLink: 'https://himalayas.app/jobs/1' }], totalCount: 2, limit: 1 };
+      throw new Error('fixture later query failed');
+    },
+  });
+  assert.equal(himalayas.length, 1);
+  assert.equal(himalayas.collection.status, 'partial');
+  assert.deepEqual(himalayas.collection.continuation, { query: 'analytics', page: 1 });
+
+  const themuse = await collectTheMuseLeads({
+    scope: 'nyc', maxPages: 2,
+    requestJson: async url => {
+      if (new URL(url).searchParams.get('page') === '0') return { page_count: 2, results: [{ name: 'Data Engineer',
+        company: { name: 'Acme' }, locations: [{ name: 'New York, NY' }], refs: { landing_page: 'https://www.themuse.com/jobs/acme/data' } }] };
+      throw new Error('fixture later page failed');
+    },
+  });
+  assert.equal(themuse.length, 1);
+  assert.equal(themuse.collection.status, 'partial');
+  assert.deepEqual(themuse.collection.continuation, { page: 1 });
+
+  const newgrad = await collectNewgradJobsLeads({
+    scope: 'remote', mode: 'backfill', categories: ['data_analysis'], maxPagesPerCategory: 2,
+    requestText: async () => nextDataHtml([{ id: 'one', company: 'Acme', title: 'Data Engineer', location: 'US', workModel: 'Remote', h1bSponsored: 'Yes' }]),
+    requestJson: async () => { throw new Error('fixture later page failed'); },
+  });
+  assert.equal(newgrad.length, 1);
+  assert.equal(newgrad.collection.status, 'partial');
+  assert.deepEqual(newgrad.collection.continuation, { category: 'data_analysis', position: 1 });
+});
+
+test('a malformed later dashboard page preserves earlier rows as partial progress', async () => {
+  const rows = await collectTheMuseLeads({
+    scope: 'nyc', maxPages: 2,
+    requestJson: async url => (new URL(url).searchParams.get('page') === '0'
+      ? { page_count: 2, results: [{ name: 'Data Engineer', company: { name: 'Acme' },
+        locations: [{ name: 'New York, NY' }], refs: { landing_page: 'https://www.themuse.com/jobs/acme/data' } }] }
+      : { page_count: 2, results: null }),
+  });
+  assert.equal(rows.length, 1);
+  assert.equal(rows.collection.status, 'partial');
+  assert.deepEqual(rows.collection.continuation, { page: 1 });
+  assert.match(rows.collection.error, /results array/i);
+});
+
 test('freehire reconstructs a direct owner-verifiable ATS URL from trusted source coordinates', async () => {
   const rows = await collectFreehireLeads({
     scope: 'remote', mode: 'backfill', purpose: 'companies', pageSize: 10, maxPages: 1,
@@ -289,4 +353,20 @@ test('The Muse public dashboard keeps only NYC Metro or remote company leads and
   assert.deepEqual(nyc.map(row => row.company), ['NY Co']);
   assert.deepEqual(remote.map(row => row.company), ['Remote Co']);
   assert.equal(nyc[0].posted_at, '2026-09-09T12:00:00.000Z');
+});
+
+test('The Muse marks an exhausted page budget partial and resumes its saved frontier', async () => {
+  const requested = [];
+  const requestJson = async url => {
+    const page = Number(new URL(url).searchParams.get('page'));
+    requested.push(page);
+    return { page_count: 3, results: [{ name: `Role ${page}`, company: { name: `Co ${page}` },
+      locations: [{ name: 'New York, NY' }], refs: { landing_page: `https://www.themuse.com/jobs/co-${page}/role` } }] };
+  };
+  const first = await collectTheMuseLeads({ scope: 'nyc', maxPages: 1, requestJson });
+  assert.equal(first.collection.status, 'partial');
+  assert.deepEqual(first.collection.continuation, { page: 1 });
+  const second = await collectTheMuseLeads({ scope: 'nyc', maxPages: 2, continuation: first.collection.continuation, requestJson });
+  assert.equal(second.collection, undefined);
+  assert.deepEqual(requested, [0, 1, 2]);
 });

@@ -20,12 +20,27 @@ import { isMainModule } from '../../lib/is-main-module.mjs';
 import { portalEntryBoardKey, portalBoardKey } from './sunny-company-expansion.mjs';
 import { statePaths } from './sunny-company-state.mjs';
 import { enqueueScanReceipt } from './sunny-job-queue.mjs';
+import { createProviderContinuation } from './sunny-provider-continuation.mjs';
 import { ingestScanReceiptExceptions } from './sunny-scan-exception-queue.mjs';
 import { withSunnyRoutineLease } from './sunny-routine-runtime.mjs';
 import { refreshScanStatusSnapshot } from './build-sunny-scan-status.mjs';
 
 const CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-const PARTIAL_PATTERN = /\b(?:partial|truncat(?:ed|ion)?|page cap|max_pages|budget exhausted)\b/i;
+const PARTIAL_PATTERN = /\b(?:partial|truncat(?:ed|ion)?|page cap|max_pages|budget exhausted|still incomplete|unsplittable|missing partition|repeated page|changing total)\b/i;
+
+/** Freeze a daily calendar window before launching the child scanner. */
+export function frozenDailyWindow(now, since) {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' })
+    .formatToParts(new Date(now));
+  const value = type => parts.find(part => part.type === type)?.value;
+  const end = new Date(Date.UTC(Number(value('year')), Number(value('month')) - 1, Number(value('day'))));
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - Number(since));
+  return {
+    posted_after: start.toISOString().slice(0, 10), posted_before: end.toISOString().slice(0, 10),
+    timezone: 'America/New_York', semantics: 'calendar-date-inclusive',
+  };
+}
 
 export function buildExactBoardPortals(fullConfig, { provider, identifier }) {
   const targetKey = portalBoardKey({ provider, board_identifier: identifier });
@@ -50,6 +65,8 @@ export function classifyScanCompletion({ exitCode, stderr = '', receipt = null }
   if (exitCode !== 0 || receipt?.version !== 'careerops.scan.receipt@1'
     || !Array.isArray(receipt.added_urls) || !Array.isArray(receipt.errors) || receipt.errors.length > 0) return 'error';
   if (PARTIAL_PATTERN.test(stderr) || receipt.partial === true || receipt.partial_boards?.length > 0
+    || receipt.source_observations?.some(observation => observation?.complete === false)
+    || receipt.source_observations?.some(observation => observation?.continuation?.complete === false || observation?.continuation?.incomplete === true)
     || Number(receipt.skipped || 0) > 0
     || (Array.isArray(receipt.warnings) && receipt.warnings.some(warning => PARTIAL_PATTERN.test(typeof warning === 'string' ? warning : JSON.stringify(warning))))) return 'partial';
   return 'complete';
@@ -130,6 +147,7 @@ export async function runSerializedScan({
   runId: suppliedRunId,
   lockOptions,
   routineLease = kind === 'daily',
+  recoveryOf = null,
   refreshStatus = refreshScanStatusSnapshot,
   statusOutputPath,
 } = {}) {
@@ -150,6 +168,9 @@ export async function runSerializedScan({
 
     const startedAt = new Date(now).toISOString();
     const runId = suppliedRunId || `${kind}-${startedAt.replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`;
+    const originalWindow = kind === 'daily' ? frozenDailyWindow(now, since) : {
+      posted_after: postedAfter, posted_before: postedBefore, timezone: 'America/New_York', semantics: 'calendar-date-inclusive',
+    };
     let portalsPath = paths.portals;
     let temporaryPortals = '';
     let exactCompany = '';
@@ -170,7 +191,7 @@ export async function runSerializedScan({
 
     const args = kind === 'backfill'
       ? ['--posted-after', postedAfter, '--posted-before', postedBefore, '--quiet', '--json']
-      : ['--since', String(since), '--quiet', '--json'];
+      : ['--posted-after', originalWindow.posted_after, '--posted-before', originalWindow.posted_before, '--quiet', '--json'];
     if (dryRun) args.unshift('--dry-run');
     const env = {
       ...process.env,
@@ -178,6 +199,18 @@ export async function runSerializedScan({
       CAREER_OPS_PORTALS: portalsPath,
       CAREER_OPS_SCAN_HISTORY: historyPath,
       CAREER_OPS_PIPELINE: pipelinePath,
+      // Binds provider continuation state to this immutable serialized scan,
+      // instead of letting a later unrelated run inherit its frontier.
+      CAREER_OPS_SCAN_RUN_ID: runId,
+      // A recovery has a fresh invocation receipt, but its provider pages are
+      // the same original gap.  Keep that identity stable so a bounded retry
+      // resumes the existing ledger instead of starting a second frontier.
+      CAREER_OPS_ORIGIN_GAP: recoveryOf?.origin_gap || recoveryOf?.origin_run_id || runId,
+      // Provider HTTP helpers share this opt-in per-host reservation inside
+      // the child. The serialized scan lock prevents a second Sunny child
+      // from bypassing it while this receipt is being produced.
+      CAREER_OPS_SUNNY_HOST_SPACING_MS: process.env.CAREER_OPS_SUNNY_HOST_SPACING_MS || '150',
+      CAREER_OPS_SUNNY_SERIALIZED_INTAKE: '1',
     };
     const before = {
       history_lines: countLines(historyPath),
@@ -210,6 +243,8 @@ export async function runSerializedScan({
         posted_after: postedAfter,
         posted_before: postedBefore,
       } : { since_days: Number(since) }),
+      original_window: originalWindow,
+      ...(recoveryOf ? { recovery_of: recoveryOf } : {}),
       dry_run: dryRun,
       exit_code: Number(childResult.exitCode),
       completion_status: completionStatus,
@@ -226,6 +261,14 @@ export async function runSerializedScan({
     // Persist receipt first: a queue-write failure can be replayed without rescanning.
     if (!dryRun && scanReceipt?.version === 'careerops.scan.receipt@1' && Array.isArray(scanReceipt.added_urls)) {
       await enqueueScanReceipt(receipt, { dataRoot: paths.root });
+      // Queue persistence is the canonical Sunny intake boundary.  Only now
+      // may a fetched provider payload move its durable cursor forward.
+      for (const acknowledgement of scanReceipt.continuation_acknowledgements || []) {
+        const continuation = createProviderContinuation({ dataRoot: paths.root, key: acknowledgement.key });
+        if (!continuation) continue;
+        for (const page of acknowledgement.pages || []) continuation.acknowledge(page);
+        if (acknowledgement.complete) continuation.complete();
+      }
     }
     const scanExceptionResult = dryRun
       ? { recorded: 0, dry_run: true }

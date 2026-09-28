@@ -9,6 +9,7 @@ import { enqueueScanReceipt, readPendingJobs, reconcileScanReceipts } from './su
 import { runSerializedScan } from './run-sunny-serialized-scan.mjs';
 import { readRunStatus, startOrResumeRun, claimDailyScan, recordDailyScanReceipt, markMissingScanReceipt, markRunPartial, suspendCurrentExceptionBatch, restoreSuspendedBatch } from './sunny-daily-run-state.mjs';
 import { ingestScanReceiptExceptions } from './sunny-scan-exception-queue.mjs';
+import { isSourceKey } from './sunny-source-identity.mjs';
 
 function compareExceptions(left, right) {
   return String(left.next_retry_at).localeCompare(String(right.next_retry_at))
@@ -88,6 +89,10 @@ export async function buildDailyWorkPlan({
   scan = runSerializedScan,
   catchUp = false,
   retryCurrentOnce = false,
+  // The 15:00 worker is recovery-only. It never claims a daily scan and may
+  // temporarily suspend an old diagnosis batch so one due exact source can
+  // recover; normal candidate work still remains the first priority.
+  retryOnly = false,
   scanReceipt,
 } = {}) {
   if (catchUp && runScan) throw new Error('Catch-up requires --no-scan');
@@ -134,6 +139,10 @@ export async function buildDailyWorkPlan({
   let existing = readRunStatus({ dataRoot, now });
   const pendingBeforeResume = readPendingJobs({ dataRoot });
   if (existing.current_batch && ['diagnosis', 'source_retry', 'candidate_retry'].includes(existing.current_batch.type) && pendingBeforeResume.length) {
+    await suspendCurrentExceptionBatch({ dataRoot, now });
+    existing = readRunStatus({ dataRoot, now });
+  }
+  if (retryOnly && existing.current_batch?.type === 'diagnosis' && !pendingBeforeResume.length) {
     await suspendCurrentExceptionBatch({ dataRoot, now });
     existing = readRunStatus({ dataRoot, now });
   }
@@ -194,7 +203,7 @@ export async function buildDailyWorkPlan({
     };
   }
 
-  if ((existing.suspended_batches || []).length) {
+  if ((existing.suspended_batches || []).length && !retryOnly) {
     const state = await restoreSuspendedBatch({ dataRoot, now });
     const batch = state.current_batch;
     return {
@@ -213,8 +222,9 @@ export async function buildDailyWorkPlan({
     : dueRetryableExceptions(dataRoot, now);
   // Keep a batch homogeneous: the worker has different terminal adapters for
   // candidate and source retries, and immutable membership makes restart safe.
-  const candidateRetries = due.filter(item => item.key.startsWith('candidate|')).slice(0, exceptionLimit);
-  const sourceRetries = candidateRetries.length ? [] : due.filter(item => item.key.startsWith('source|')).slice(0, exceptionLimit);
+  const candidateRetries = retryOnly ? [] : due.filter(item => item.key.startsWith('candidate|')).slice(0, exceptionLimit);
+  const sourceRetries = (retryOnly || !candidateRetries.length)
+    ? due.filter(item => isSourceKey(item.key)).slice(0, exceptionLimit) : [];
   const exceptionJobs = [...candidateRetries, ...sourceRetries];
   const acknowledgedBlockers = readRunStatus({ dataRoot, now }).counts.diagnoses_acknowledged_unresolved;
   if (!exceptionJobs.length && !diagnosesDue.length && acknowledgedBlockers) {
@@ -266,7 +276,7 @@ function positiveNumber(args, flag, fallback) {
 }
 
 function parseCliArgs(args) {
-  const known = new Set(['--since', '--normal-limit', '--exception-limit', '--no-scan', '--catch-up', '--retry-current-once', '--scan-receipt']);
+  const known = new Set(['--since', '--normal-limit', '--exception-limit', '--no-scan', '--catch-up', '--retry-current-once', '--retry-only', '--scan-receipt']);
   for (const arg of args) if (arg.startsWith('--') && !known.has(arg.split('=')[0])) throw new Error(`Unknown flag: ${arg}`);
   return {
     since: positiveNumber(args, '--since', 3),
@@ -275,6 +285,7 @@ function parseCliArgs(args) {
     runScan: !args.includes('--no-scan'),
     catchUp: args.includes('--catch-up'),
     retryCurrentOnce: args.includes('--retry-current-once'),
+    retryOnly: args.includes('--retry-only'),
     scanReceipt: flagValue(args, '--scan-receipt'),
   };
 }

@@ -669,9 +669,11 @@ export default {
      * Returns the facets alongside the jobs because the caller needs them to
      * decide whether this query was clamped and, if so, what to split it on.
      */
-    const runQuery = async (appliedFacets) => {
+    const runQuery = async (appliedFacets, startOffset = 0) => {
       pagesSpent++;
-      const first = await fetchJsonWithRetry(ctx, ep.api, { ...postOpts, body: makeBody(0, appliedFacets) }, RETRY_POLICY);
+      const first = await fetchJsonWithRetry(ctx, ep.api, { ...postOpts, body: makeBody(startOffset, appliedFacets) }, RETRY_POLICY);
+      const partition = JSON.stringify(appliedFacets || {});
+      ctx?.continuation?.savePage?.(`partition:${partition}:offset:${startOffset}`, first, { partition: appliedFacets, offset: startOffset });
       const jobs = parseWorkdayResponse(first, entry);
 
       const total = typeof first?.total === 'number' ? first.total : null;
@@ -683,7 +685,7 @@ export default {
       // maxPages. When `total` is absent, only probe further pages if the first
       // one was full — a short first page already means there's nothing more.
       let pagesToFetch = total !== null
-        ? Math.min(Math.ceil(total / PAGE_SIZE), maxPages)
+        ? Math.min(Math.ceil((total - startOffset) / PAGE_SIZE), maxPages)
         : (firstPostings.length >= PAGE_SIZE ? maxPages : 1);
       pagesToFetch = Math.min(pagesToFetch, ctxCap);
 
@@ -718,10 +720,11 @@ export default {
       // receive a burst of parallel requests, and a mid-run failure stops
       // cleanly with whatever pages were already gathered instead of
       // discarding them (Promise.all would fail the whole batch on one error).
-      let page = 1;
+      let page = Math.floor(startOffset / PAGE_SIZE) + 1;
       if (stopReason === 'complete') {
-        for (; page < pagesToFetch; page++) {
-          if (pagesSpent >= pageBudget) { budgetExhausted = true; break; }
+        const finalPage = page + pagesToFetch - 1;
+        for (; page < finalPage; page++) {
+          if (pagesSpent >= pageBudget) { budgetExhausted = true; stopReason = 'budget-exhausted'; break; }
           await sleep(INTER_PAGE_DELAY_MS, ctx);
           pagesSpent++;
           let json;
@@ -737,6 +740,7 @@ export default {
             stopReason = 'fetch-error';
             break;
           }
+          ctx?.continuation?.savePage?.(`partition:${partition}:offset:${page * PAGE_SIZE}`, json, { partition: appliedFacets, offset: page * PAGE_SIZE });
           const pageJobs = parseWorkdayResponse(json, entry);
           jobs.push(...pageJobs);
           if (total === null) {
@@ -745,15 +749,36 @@ export default {
           }
           if (pageIsPastWindow(pageJobs, sinceMs)) { stopReason = 'early-stop'; break; }
         }
-        if (stopReason === 'complete' && page === pagesToFetch && pagesToFetch === maxPages) {
+        if (stopReason === 'complete' && page === finalPage && pagesToFetch === maxPages
+          && (!ctx?.continuation || total === null || Math.ceil((total - startOffset) / PAGE_SIZE) > maxPages)) {
           stopReason = 'cap';
         }
       }
 
-      return { jobs, total, facets, stopReason, clamped };
+      return { jobs, total, facets, stopReason, clamped, appliedFacets, nextOffset: stopReason === 'complete' || stopReason === 'early-stop' || stopReason === 'no-date-skip' ? null : page * PAGE_SIZE };
     };
 
-    const root = await runQuery({});
+    // Resume the exact frontier saved by the prior bounded invocation.  The
+    // frontier is a query partition, not an aggregate board counter.
+    const priorFrontier = ctx?.continuation?.snapshot?.()?.pending_partitions;
+    const firstPending = Array.isArray(priorFrontier) ? priorFrontier[0] : null;
+    // A saved CXS response is not consumed merely because a later invocation
+    // can see its frontier.  Replay every unacknowledged page first and leave
+    // that frontier untouched; the serialized parent acknowledges only after
+    // canonical Sunny intake succeeds.
+    const savedPayloads = ctx?.continuation?.pending?.() || [];
+    if (savedPayloads.length) {
+      const replayJobs = savedPayloads.flatMap(page => parseWorkdayResponse(page.payload, entry));
+      const pendingPartitions = Array.isArray(priorFrontier) ? priorFrontier : [];
+      replayJobs.continuationPages = savedPayloads.map(page => page.identity);
+      replayJobs.continuationComplete = false;
+      replayJobs.workdayContinuation = {
+        complete: false, incomplete: true, reason: 'pending_intake', pending_partitions: pendingPartitions,
+        pages_spent: 0, split_slices_spent: 0, page_budget: pageBudget,
+      };
+      return replayJobs;
+    }
+    const root = await runQuery(firstPending?.applied_facets || {}, Number(firstPending?.offset) || 0);
     const { total, stopReason } = root;
 
     // Set when the split ran out of depth, slices, or splittable facets with
@@ -763,7 +788,7 @@ export default {
     let slicesSpent = 0;
     let jobs = root.jobs;
 
-    if (root.clamped) {
+    if (root.clamped && !ctx?.continuation) {
       // Slices overlap wherever a posting carries several values of the split
       // facet, and every slice re-includes what the unfaceted page 0 already
       // returned, so the union is deduped on the posting URL. Only the split
@@ -882,6 +907,57 @@ export default {
       // recovered on top of the ceiling.
       const short = splitIncomplete || budgetExhausted ? ' (still incomplete)' : '';
       console.error(`⚠️  workday: ${entry.name} offset-clamped at ${WORKDAY_OFFSET_CEILING} — recovered ${jobs.length} jobs via ${slicesSpent} facet slices${short}`);
+    }
+
+    // A continuation crawl deliberately advances one durable partition per
+    // invocation.  A clamped root is replaced by its facet children rather
+    // than retried at the next offset: the children are the only path past a
+    // Workday offset ceiling.  This is separate from the legacy in-process
+    // split above, which remains for ordinary callers without a ledger.
+    let continuationPlan = null;
+    if (ctx?.continuation) {
+      const pending = Array.isArray(priorFrontier) ? [...priorFrontier] : [];
+      const completed = Array.isArray(ctx.continuation.snapshot?.()?.completed_partitions)
+        ? [...ctx.continuation.snapshot().completed_partitions] : [];
+      const current = firstPending || { applied_facets: {}, offset: 0, depth: 0, excluded_facets: [] };
+      if (pending.length > 0) pending.shift();
+      let terminalReason = '';
+      if (root.clamped) {
+        const depth = Number(current.depth) || 0;
+        const facet = depth >= MAX_SPLIT_DEPTH ? null : chooseSplitFacet(root.facets, {
+          exclude: current.excluded_facets || [],
+          locationHints: ctx?.locationHints,
+        });
+        if (!facet) {
+          terminalReason = 'unsplittable_partition';
+        } else {
+          const chosenCoverage = facet.values.reduce((sum, value) => sum + value.count, 0);
+          const trueTotal = trueTotalFromFacets(root.facets);
+          const otherCoverage = (root.facets || [])
+            .filter(value => value?.facetParameter !== facet.facetParameter)
+            .map(facetCoverage)
+            .filter(value => value !== null);
+          const spread = otherCoverage.length > 0 ? Math.max(...otherCoverage) - Math.min(...otherCoverage) : 0;
+          if (trueTotal !== null && trueTotal - chosenCoverage > spread) {
+            terminalReason = 'unsplittable_partition';
+          } else {
+            const children = facet.values.map(value => ({
+              applied_facets: { ...(root.appliedFacets || {}), [facet.facetParameter]: [value.id] },
+              offset: 0,
+              depth: depth + 1,
+              excluded_facets: [...(current.excluded_facets || []), facet.facetParameter],
+              reason: 'facet_frontier',
+            }));
+            pending.unshift(...children);
+            completed.push({ applied_facets: root.appliedFacets || {}, status: 'split', facet: facet.facetParameter });
+          }
+        }
+      } else if (['fetch-error', 'cap', 'budget-exhausted'].includes(stopReason)) {
+        pending.unshift({ ...current, offset: root.nextOffset ?? current.offset ?? 0, reason: stopReason === 'fetch-error' ? 'page_error' : stopReason === 'budget-exhausted' ? 'budget_exhausted' : 'page_cap' });
+      } else {
+        completed.push({ applied_facets: root.appliedFacets || {}, status: stopReason === 'early-stop' ? 'window_stopped' : 'complete' });
+      }
+      continuationPlan = { pending, completed, terminalReason };
     }
 
     // Resolve `"53 Locations"` placeholders into the real places (#3860). Runs
@@ -1044,6 +1120,36 @@ export default {
     // A split that could not reach the whole board is the same kind of partial
     // result, and scan-ats-full.mjs already knows how to report that tag.
     if (splitIncomplete || budgetExhausted) jobs.workdayTruncated = true;
+
+    // This is deliberately structured rather than inferred from stderr.  A
+    // recovery consumer must retain the frontier that was actually attempted:
+    // an incomplete split or exhausted budget cannot become a green scan just
+    // because its warning was redirected or suppressed.
+    const fallbackIncompleteReason = stopReason === 'fetch-error' ? 'page_error'
+      : stopReason === 'cap' ? 'page_cap'
+        : splitIncomplete ? 'unsplittable_partition'
+          : budgetExhausted ? 'budget_exhausted' : '';
+    const incompleteReason = continuationPlan?.terminalReason
+      || (continuationPlan?.pending.length ? continuationPlan.pending[0].reason || 'still_incomplete' : '')
+      || fallbackIncompleteReason;
+    if (ctx?.continuation) {
+      const snapshot = ctx.continuation.snapshot?.() || {};
+      ctx.continuation.state?.({
+        provider: 'workday', pending_partitions: continuationPlan?.pending || (incompleteReason ? [{ applied_facets: root.appliedFacets || {}, offset: root.nextOffset ?? 0, reason: incompleteReason }] : []),
+        completed_partitions: continuationPlan?.completed || (incompleteReason ? [] : [{ applied_facets: {}, status: stopReason === 'early-stop' ? 'window_stopped' : 'complete' }]),
+        pages_spent: pagesSpent, split_slices_spent: slicesSpent, page_budget: pageBudget,
+        stop_reason: incompleteReason || (stopReason === 'early-stop' ? 'window_stopped' : 'complete'),
+        continuation_progress: continuationPlan?.pending.length ? { status: 'advanced', remaining_partitions: continuationPlan.pending.length, completed_partitions: continuationPlan.completed.length } : undefined,
+      });
+      jobs.continuationPages = ctx.continuation.pending?.().map(page => page.identity) || [];
+      jobs.continuationComplete = !incompleteReason;
+      if (incompleteReason && !['facet_frontier', 'page_cap'].includes(incompleteReason)) ctx.continuation.incomplete?.({ type: incompleteReason, provider: 'workday', complete: false, pages_spent: pagesSpent, split_slices_spent: slicesSpent });
+    }
+    if (incompleteReason) jobs.workdayContinuation = {
+      complete: false, incomplete: true, reason: incompleteReason,
+      pending_partitions: continuationPlan?.pending || [{ applied_facets: root.appliedFacets || {}, offset: root.nextOffset ?? 0, reason: incompleteReason }],
+      pages_spent: pagesSpent, split_slices_spent: slicesSpent, page_budget: pageBudget,
+    };
 
     return jobs;
   },

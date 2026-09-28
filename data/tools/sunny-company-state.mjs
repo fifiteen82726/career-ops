@@ -17,7 +17,7 @@ import { getCareerOpsRoot } from '../../path-resolver.mjs';
 import { acquirePipelineLock } from '../../pipeline-lock.mjs';
 
 export const RESOLUTION_COLUMNS = [
-  'normalized_lead', 'preferred_name', 'first_seen', 'last_seen', 'source_count',
+  'normalized_lead', 'preferred_name', 'scope', 'first_seen', 'last_seen', 'source_count',
   'status', 'dol_legal_name', 'dol_dba', 'transfer_positions', 'match_type',
   'provider', 'board_identifier', 'careers_url', 'board_owner', 'health_status',
   'last_attempt_at', 'next_retry_at', 'backfill_status', 'backfill_window_start',
@@ -28,7 +28,7 @@ export const RESOLUTION_COLUMNS = [
 
 export const RESOLUTION_STATUSES = new Set([
   'already_tracked', 'dol_rejected', 'dol_ambiguous', 'ats_unresolved',
-  'official_careers_only', 'identity_review', 'verification_error', 'accepted',
+  'official_careers_only', 'identity_review', 'verification_error', 'environment_unavailable', 'accepted',
 ]);
 
 export const BACKFILL_STATUSES = new Set([

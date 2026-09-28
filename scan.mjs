@@ -76,6 +76,9 @@ import { localToday } from './lib/local-today.mjs';
 import { printScanSummaryHeader } from './lib/scan-summary-marker.mjs';
 import { isMainModule } from './lib/is-main-module.mjs';
 import { promoteKnownFragmentIdentity } from './url-key.mjs';
+import { isRefusedRedirectError } from './providers/_http.mjs';
+import { portalEntryBoardKey } from './data/tools/sunny-company-expansion.mjs';
+import { createProviderContinuation } from './data/tools/sunny-provider-continuation.mjs';
 
 try {
   const { config } = await import('dotenv');
@@ -3363,6 +3366,19 @@ async function main() {
   let totalDupes = 0;
   const newOffers = [];
   const errors = [...resolveErrors];
+  // Machine-readable per-board evidence.  Keep the legacy `errors` array for
+  // callers that only render company/error, while recovery consumers can bind
+  // a failure to the actual provider/board that was requested.
+  const sourceObservations = [];
+  // A provider page is acknowledged only after this scanner's normal durable
+  // writers succeeded.  Keeping this list outside per-board tasks gives one
+  // all-or-nothing intake boundary without changing legacy provider arrays.
+  const continuationAcks = [];
+  // A serialized Sunny parent owns the final acknowledgement.  If its child
+  // stdout is lost after history has been written, these eligible replay URLs
+  // let the next child restore canonical Sunny intake without duplicating the
+  // scanner's history/pipeline writes.
+  const replayedContinuationUrls = new Set();
   const emptyTargets = [];
   const unverifiedZeroTargets = [];
 
@@ -3394,7 +3410,12 @@ async function main() {
 
   const tasks = targets.map(company => async () => {
     let provider = company._provider;
-    const observation = { requests: 0, successfulResponses: 0, lastStatus: null };
+    const observation = { requests: 0, successfulResponses: 0, lastStatus: null, endpoints: [], statuses: [], retry_after: null };
+    const canonicalBoard = () => {
+      const key = portalEntryBoardKey({ ...company, provider: provider.id });
+      const [canonicalProvider, board_identifier] = String(key).split('\t');
+      return canonicalProvider && board_identifier ? { provider: canonicalProvider, board_identifier } : { provider: provider.id, board_identifier: null };
+    };
     // includeUndated is deliberately ALWAYS true, independent of the window.
     // It does not mean "include undated postings in the results" — scan.mjs
     // already decides that downstream, where buildPostedDateFilter passes a
@@ -3411,9 +3432,13 @@ async function main() {
     // every tenant that mixes.
     const ctx = {
       ...makeHttpCtx({
-        onRequest: () => { observation.requests++; },
-        onResponse: status => {
-          observation.lastStatus = status;
+        onRequest: request => { observation.requests++; if (request) observation.endpoints.push(String(request)); },
+        onResponse: (response, endpoint, headers) => {
+          const status = typeof response === 'number' ? response : response?.status;
+          observation.lastStatus = status ?? observation.lastStatus;
+          if (endpoint || response?.url) observation.endpoints.push(String(endpoint || response.url));
+          if (status != null) observation.statuses.push(status);
+          if ((headers || response?.headers)?.get?.('retry-after')) observation.retry_after = (headers || response.headers).get('retry-after');
           if (status >= 200 && status < 300) observation.successfulResponses++;
         },
       }),
@@ -3421,6 +3446,19 @@ async function main() {
       includeUndated: true,
       locationHints: config.location_filter,
     };
+    const coordinatesForContinuation = canonicalBoard();
+    if ((provider.id === 'jibeapply' || provider.id === 'workday') && effectiveAfter && postedBefore && coordinatesForContinuation.board_identifier) {
+      ctx.continuation = createProviderContinuation({
+        dataRoot: DATA_ROOT,
+        key: {
+          origin_gap: process.env.CAREER_OPS_ORIGIN_GAP || process.env.CAREER_OPS_SCAN_RUN_ID || 'scan',
+          provider: coordinatesForContinuation.provider,
+          board_identifier: coordinatesForContinuation.board_identifier,
+          window: { posted_after: effectiveAfter, posted_before: postedBefore },
+        },
+      });
+    }
+    const hasPendingContinuationPayload = Boolean(ctx.continuation?.pending?.().length);
     let sourceName = provider.id === 'local-parser' ? 'local-parser' : `${provider.id}-api`;
     try {
       let jobs;
@@ -3441,6 +3479,27 @@ async function main() {
       if (!Array.isArray(jobs)) {
         throw new Error(`${provider.id}: fetch() did not return an array`);
       }
+      if (ctx.continuation && Array.isArray(jobs.continuationPages) && jobs.continuationPages.length) {
+        continuationAcks.push({ continuation: ctx.continuation, pages: jobs.continuationPages, complete: jobs.continuationComplete === true });
+      }
+      const incomplete = Boolean(jobs.workdayTruncated || jobs.icimsTruncated || jobs.jibeapplyTruncated
+        || jobs.workdayContinuation?.incomplete || jobs.jibeapplyContinuation?.incomplete);
+      const coordinates = canonicalBoard();
+      sourceObservations.push({
+        provider: coordinates.provider,
+        board_identifier: coordinates.board_identifier,
+        company: company.name,
+        endpoint: observation.endpoints.at(-1) || company.api || company.careers_url || null,
+        requested_endpoints: [...new Set(observation.endpoints)],
+        request_count: observation.requests,
+        http_status: observation.lastStatus,
+        http_statuses: observation.statuses,
+        retry_after: observation.retry_after,
+        outcome: incomplete ? 'incomplete_coverage' : jobs.length === 0 ? (observation.successfulResponses ? 'verified_empty' : 'unverified_empty') : 'success',
+        complete: !incomplete,
+        continuation: jobs.jibeapplyContinuation || jobs.workdayContinuation || null,
+        job_count: jobs.length,
+      });
       totalFound += jobs.length;
       if (!company._isBoard && jobs.length === 0) {
         if (emptyTargetStatus(observation) === 'empty') emptyTargets.push(company.name);
@@ -3514,6 +3573,7 @@ async function main() {
         }
         const dedupUrl = normalizeUrlForDedup(job.url);
         if (seenUrls.has(dedupUrl)) {
+          if (process.env.CAREER_OPS_SUNNY_SERIALIZED_INTAKE === '1' && hasPendingContinuationPayload) replayedContinuationUrls.add(job.url);
           totalDupes++;
           continue;
         }
@@ -3564,11 +3624,31 @@ async function main() {
         });
       }
     } catch (err) {
+      const kind = isRefusedRedirectError(err) ? 'retired_route' : classifyFetchError(err);
+      const coordinates = canonicalBoard();
+      sourceObservations.push({
+        provider: coordinates.provider,
+        board_identifier: coordinates.board_identifier,
+        company: company.name,
+        endpoint: observation.endpoints.at(-1) || company.api || company.careers_url || null,
+        requested_endpoints: [...new Set(observation.endpoints)],
+        request_count: observation.requests,
+        http_status: err.status ?? observation.lastStatus,
+        http_statuses: observation.statuses,
+        retry_after: err.retryAfter ?? observation.retry_after ?? null,
+        error_name: err?.name || 'Error',
+        error_code: err?.code || null,
+        nested_error: err?.cause ? { name: err.cause.name || null, message: err.cause.message || null, code: err.cause.code || null } : null,
+        outcome: kind === 'network' ? 'transient_failure' : kind,
+        complete: false,
+      });
       errors.push({
         company: company.name,
         error: err.message,
-        kind: classifyFetchError(err),
+        kind,
         status: err.status ?? observation.lastStatus,
+        provider: coordinates.provider,
+        board_identifier: coordinates.board_identifier,
       });
     }
   });
@@ -3612,6 +3692,16 @@ async function main() {
   if (!dryRun && verifiedOffers.length > 0) {
     await appendToPipeline(verifiedOffers);
     await appendToScanHistory(verifiedOffers, date);
+  }
+  if (!dryRun) {
+    // The downstream writers above are the intake commit.  A crash before this
+    // point leaves the immutable payload unacknowledged and replayable.
+    if (process.env.CAREER_OPS_SUNNY_SERIALIZED_INTAKE !== '1') {
+      for (const { continuation, pages, complete } of continuationAcks) {
+        for (const identity of pages) continuation.acknowledge(identity);
+        if (complete) continuation.complete();
+      }
+    }
   }
   if (!dryRun && cooldownOffers.length > 0) {
     const cooldownGroups = {};
@@ -3907,7 +3997,12 @@ async function main() {
       duplicates: totalDupes,
       added: verifiedOffers.length,
       added_urls: verifiedOffers.map(offer => offer.url),
-      errors: errors.map(({ company, error }) => ({ company, error })),
+      ...(process.env.CAREER_OPS_SUNNY_SERIALIZED_INTAKE === '1' ? {
+        canonical_intake_urls: [...new Set([...verifiedOffers.map(offer => offer.url), ...replayedContinuationUrls])],
+        continuation_acknowledgements: continuationAcks.map(({ continuation, pages, complete }) => ({ key: continuation.key, pages, complete })),
+      } : {}),
+      errors: errors.map(({ company, error, provider, board_identifier, kind, status }) => ({ company, error, provider, board_identifier, kind, status })),
+      source_observations: sourceObservations,
       unverified_zero: unverifiedZeroTargets,
       dry_run: dryRun,
     }, errors.length > 0 ? 2 : 0);

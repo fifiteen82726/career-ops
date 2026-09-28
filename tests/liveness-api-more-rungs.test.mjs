@@ -6,6 +6,7 @@ const greenhouse = 'https://careers.example.com/detail/7823005003/?gh_jid=782300
 const smartrecruiters = 'https://jobs.smartrecruiters.com/ServiceNow/744000131661949-senior-director';
 const arbeitsagentur = 'https://www.arbeitsagentur.de/jobsuche/jobdetail/10001-1003597288-S';
 const wwr = 'https://weworkremotely.com/remote-jobs/acme-staff-engineer';
+const icims = 'https://careers-acme.icims.com/jobs/42/analytics-engineer/job';
 
 async function withFetch(mock, run) {
   const previous = globalThis.fetch;
@@ -19,8 +20,22 @@ test('four new URL shapes route only to fixed API hosts', () => {
     'https://api.smartrecruiters.com/v1/companies/ServiceNow/postings/744000131661949');
   assert.match(resolveAtsApi(arbeitsagentur).apiUrl, /^https:\/\/rest\.arbeitsagentur\.de\//);
   assert.equal(resolveAtsApi(wwr).apiUrl, 'https://weworkremotely.com/remote-jobs.rss');
+  assert.equal(resolveAtsApi(icims).apiUrl, `${icims}?in_iframe=1`);
   assert.equal(resolveAtsApi('https://jobs.smartrecruiters.com.evil.test/ServiceNow/123-title'), null);
   assert.equal(resolveAtsApi('https://weworkremotely.com/remote-jobs/%2e%2e'), null);
+});
+
+test('iCIMS dispatches an exact job route and does not treat a shell as live', async () => {
+  const shell = await withFetch(async (url, opts) => {
+    assert.equal(String(url), `${icims}?in_iframe=1`);
+    assert.equal(opts.headers.accept, 'text/html');
+    return new Response('<html><body><div id="app"></div></body></html>');
+  }, () => checkLivenessViaApi(icims));
+  assert.equal(shell.result, 'uncertain');
+  const live = await withFetch(async () => new Response('<script type="application/ld+json">{"@type":"JobPosting","title":"Analytics Engineer"}</script>'), () => checkLivenessViaApi(icims));
+  assert.equal(live.result, 'active');
+  const expired = await withFetch(async () => new Response('Job ID: 42. This position is no longer available.'), () => checkLivenessViaApi(icims));
+  assert.equal(expired.result, 'expired');
 });
 
 test('Greenhouse company URL checks the per-job API after a validated embed redirect', async () => {

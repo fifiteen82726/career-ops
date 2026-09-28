@@ -77,3 +77,51 @@ test('failed state without a claim creates a red day and preserves completed his
   assert.equal(snapshot.days.find(row => row.date === '2026-09-23').status, 'green');
   assert.equal(snapshot.days.find(row => row.date === '2026-09-24').status, 'red');
 });
+
+test('an exact recovered source gap plus archived closeout can complete a historical day without changing its original receipt', () => {
+  const original = { run_id: 'daily-original', kind: 'daily', dry_run: false, started_at: '2026-09-20T16:00:00.000Z', completion_status: 'partial', warnings: ['workday incomplete'], scan_receipt: { version: 'careerops.scan.receipt@1', added_urls: [], errors: [{ provider: 'workday', board_identifier: 'tenant|External' }] } };
+  const recovery = { run_id: 'recovery-1', kind: 'backfill', dry_run: false, started_at: '2026-09-21T16:00:00.000Z', completion_status: 'complete', posted_after: '2026-09-17', posted_before: '2026-09-20', recovery_of: { origin_run_id: 'daily-original', source_key: 'source-v3|daily-original|workday|tenant%7CExternal|2026-09-17|2026-09-20|transient', original_window: { posted_after: '2026-09-17', posted_before: '2026-09-20' } }, scan_receipt: { version: 'careerops.scan.receipt@1', added_urls: [], errors: [], source_observations: [{ provider: 'workday', board_identifier: 'tenant|External', complete: true }] } };
+  const archived = { run_id: 'daily-original', ny_day: '2026-09-20', status: 'complete', scan_claim: { scan_id: 'daily-original', status: 'received' }, final_closeout: { reference: 'summary!A1' } };
+  const source = { key: recovery.recovery_of.source_key, status: 'resolved', resolution_evidence: { coverage: { provider: 'workday', board_identifier: 'tenant|External', window: recovery.recovery_of.original_window, complete: true, receipt_run_id: 'recovery-1' } } };
+  const row = buildScanStatusSnapshot({ receipts: [original, recovery], archivedStates: [archived], jobs: [], candidateExceptions: [], sourceExceptions: [source] }).days[0];
+  assert.equal(row.status, 'green');
+  assert.equal(row.executionStatus, 'complete');
+  assert.equal(row.coverageStatus, 'complete');
+  assert.deepEqual(original.scan_receipt.errors, [{ provider: 'workday', board_identifier: 'tenant|External' }]);
+});
+
+test('a resolved queue row alone, wrong evidence, probe-only recovery, or missing closeout cannot clear a historical coverage gap', () => {
+  const original = { run_id: 'daily-original', kind: 'daily', dry_run: false, started_at: '2026-09-20T16:00:00.000Z', completion_status: 'partial', warnings: ['incomplete'], scan_receipt: { version: 'careerops.scan.receipt@1', added_urls: [], errors: [{ provider: 'workday', board_identifier: 'tenant|External' }] } };
+  const key = 'source-v3|daily-original|workday|tenant%7CExternal|2026-09-17|2026-09-20|transient';
+  const resolved = { key, status: 'resolved', resolution_evidence: { coverage: { provider: 'workday', board_identifier: 'wrong', window: { posted_after: '2026-09-17', posted_before: '2026-09-20' }, complete: true, receipt_run_id: 'missing' } } };
+  const controller = { run_id: 'daily-original', ny_day: '2026-09-20', status: 'complete', scan_claim: { scan_id: 'daily-original', status: 'received' }, final_closeout: { reference: 'summary!A1' } };
+  const probe = { run_id: 'recovery-probe', kind: 'backfill', dry_run: false, started_at: '2026-09-21T16:00:00.000Z', completion_status: 'complete', recovery_of: { origin_run_id: 'daily-original', source_key: key, original_window: { posted_after: '2026-09-17', posted_before: '2026-09-20' } }, scan_receipt: { version: 'careerops.scan.receipt@1', added_urls: [], errors: [], source_observations: [{ provider: 'workday', board_identifier: 'tenant|External', complete: true, probe: true }] } };
+  const row = buildScanStatusSnapshot({ receipts: [original, probe], archivedStates: [controller], jobs: [], candidateExceptions: [], sourceExceptions: [resolved] }).days[0];
+  assert.equal(row.status, 'yellow');
+  assert.equal(row.coverageStatus, 'degraded');
+});
+
+test('one recovery cannot clear two separately resolved original source gaps', () => {
+  const window = { posted_after: '2026-09-17', posted_before: '2026-09-20' };
+  const keyA = 'source-v3|daily-original|workday|tenant%7CA|2026-09-17|2026-09-20|transient';
+  const keyB = 'source-v3|daily-original|workday|tenant%7CB|2026-09-17|2026-09-20|transient';
+  const original = { run_id: 'daily-original', kind: 'daily', dry_run: false, started_at: '2026-09-20T16:00:00.000Z', completion_status: 'partial', warnings: [], scan_receipt: { version: 'careerops.scan.receipt@1', added_urls: [], errors: [] } };
+  const recovery = { run_id: 'recovery-a', kind: 'backfill', dry_run: false, started_at: '2026-09-21T16:00:00.000Z', completion_status: 'complete', posted_after: window.posted_after, posted_before: window.posted_before, recovery_of: { origin_run_id: 'daily-original', source_key: keyA, original_window: window }, scan_receipt: { version: 'careerops.scan.receipt@1', added_urls: [], errors: [], source_observations: [{ provider: 'workday', board_identifier: 'tenant|A', complete: true }] } };
+  const controller = { run_id: 'daily-original', ny_day: '2026-09-20', status: 'complete', scan_claim: { scan_id: 'daily-original', status: 'received' }, final_closeout: { reference: 'summary!A1' } };
+  const resolved = key => ({ key, status: 'resolved', resolution_evidence: { coverage: { provider: 'workday', board_identifier: key === keyA ? 'tenant|A' : 'tenant|B', window, complete: true, receipt_run_id: 'recovery-a' } } });
+  const row = buildScanStatusSnapshot({ receipts: [original, recovery], archivedStates: [controller], jobs: [], candidateExceptions: [], sourceExceptions: [resolved(keyA), resolved(keyB)] }).days[0];
+  assert.equal(row.status, 'yellow');
+  assert.equal(row.coverageStatus, 'degraded');
+});
+
+test('a structured-only original gap can recover through its exact archived scan claim', () => {
+  const window = { posted_after: '2026-09-17', posted_before: '2026-09-20' };
+  const key = 'source-v3|daily-structured|workday|tenant%7CExternal|2026-09-17|2026-09-20|coverage';
+  const original = { run_id: 'daily-structured', kind: 'daily', dry_run: false, started_at: '2026-09-20T16:00:00.000Z', completion_status: 'partial', warnings: [], scan_receipt: { version: 'careerops.scan.receipt@1', added_urls: [], errors: [], source_observations: [{ provider: 'workday', board_identifier: 'tenant|External', complete: false, outcome: 'incomplete_coverage' }] } };
+  const recovery = { run_id: 'recovery-structured', kind: 'backfill', dry_run: false, started_at: '2026-09-21T16:00:00.000Z', completion_status: 'complete', posted_after: window.posted_after, posted_before: window.posted_before, recovery_of: { origin_run_id: 'daily-structured', source_key: key, original_window: window }, scan_receipt: { version: 'careerops.scan.receipt@1', added_urls: [], errors: [], source_observations: [{ provider: 'workday', board_identifier: 'tenant|External', complete: true }] } };
+  const controller = { run_id: 'controller-id-differs', ny_day: '2026-09-20', status: 'complete', scan_claim: { scan_id: 'daily-structured', status: 'received' }, final_closeout: { reference: 'summary!A1' } };
+  const source = { key, status: 'resolved', resolution_evidence: { coverage: { provider: 'workday', board_identifier: 'tenant|External', window, complete: true, receipt_run_id: 'recovery-structured' } } };
+  const row = buildScanStatusSnapshot({ receipts: [original, recovery], archivedStates: [controller], jobs: [], candidateExceptions: [], sourceExceptions: [source] }).days[0];
+  assert.equal(row.status, 'green');
+  assert.equal(row.coverageStatus, 'complete');
+});

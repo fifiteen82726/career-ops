@@ -193,21 +193,31 @@ function requireReceipts(directory) {
   try { return readdirSync(directory).filter(name => name.endsWith('.json')).map(name => { try { return JSON.parse(readFileSync(join(directory, name), 'utf8')); } catch { return null; } }).filter(Boolean); } catch { return []; }
 }
 
+export function refreshSunnyArtifacts({
+  checkoutRoot = resolve(import.meta.dirname, '../..'), dataRoot = getCareerOpsRoot(),
+  archivePath = resolve(`${dataRoot}/data/sunny-job-search-archive.json`),
+  outputPath = resolve(`${checkoutRoot}/local/sunny-job-search/data/jobs.json`),
+  referralPath = resolve(`${dataRoot}/data/sunny-linkedin-referrals.json`), now = new Date(),
+} = {}) {
+  let snapshot; let jobsError = null;
+  try {
+    if (!existsSync(archivePath)) throw new Error(`Sunny archive not found at ${archivePath}. Existing snapshot was preserved.`);
+    snapshot = refreshSnapshot({ archivePath, referralPath, outputPath, now });
+  } catch (error) { jobsError = error; }
+  // Status has independent durable inputs, so an archive/jobs failure must not
+  // suppress the status refresh at daily closeout.
+  const status = refreshScanStatusSnapshot({ dataRoot, outputPath: resolve(checkoutRoot, 'local/sunny-job-search/data/scan-status.json'), now });
+  if (jobsError) throw jobsError;
+  return { snapshot, status };
+}
+
 function main() {
   const checkoutRoot = resolve(import.meta.dirname, '../..');
   const dataRoot = getCareerOpsRoot();
   const archivePath = resolve(process.argv[2] || `${dataRoot}/data/sunny-job-search-archive.json`);
   const outputPath = resolve(process.argv[3] || `${checkoutRoot}/local/sunny-job-search/data/jobs.json`);
   const referralPath = resolve(process.argv[4] || `${dataRoot}/data/sunny-linkedin-referrals.json`);
-  let snapshot; let jobsError = null;
-  try {
-    if (!existsSync(archivePath)) throw new Error(`Sunny archive not found at ${archivePath}. Existing snapshot was preserved.`);
-    snapshot = refreshSnapshot({ archivePath, referralPath, outputPath });
-  } catch (error) { jobsError = error; }
-  // Status has independent durable inputs, so an archive/jobs failure must not
-  // suppress the status refresh at daily closeout.
-  refreshScanStatusSnapshot({ dataRoot, outputPath: resolve(checkoutRoot, 'local/sunny-job-search/data/scan-status.json') });
-  if (jobsError) throw jobsError;
+  const { snapshot } = refreshSunnyArtifacts({ checkoutRoot, dataRoot, archivePath, outputPath, referralPath });
   console.log(`Sunny snapshot refreshed: ${snapshot.jobs.length} jobs (${snapshot.jobs.at(-1).scanDate} to ${snapshot.jobs[0].scanDate}).`);
 }
 
