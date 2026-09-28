@@ -144,7 +144,7 @@ test('normal candidate work remains ahead of a retry-only source and leaves its 
   writeFileSync(join(dataRoot, 'data/sunny-job-queue.json'), JSON.stringify({ schema_version: 1, jobs: [{ url: 'https://example.com/normal', status: 'pending' }] }));
   await dueSource(dataRoot);
   let calls = 0;
-  const result = await runScheduledRetry({ dataRoot, now: new Date('2026-09-27T19:00:00.000Z'), scan: async () => { calls++; throw new Error('must not scan'); } });
+  const result = await runScheduledRetry({ dataRoot, now: new Date('2026-09-27T19:00:00.000Z'), scan: async () => { calls++; throw new Error('must not scan'); }, consumer: async () => ({ status: 'not_applicable', outcomes: [], pending_after: 1 }) });
   assert.equal(result.phase, 'normal');
   assert.equal(calls, 0);
   assert.equal(readRunStatus({ dataRoot }).current_batch.type, 'normal');

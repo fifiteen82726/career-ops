@@ -19,6 +19,7 @@ import { runSerializedScan } from './run-sunny-serialized-scan.mjs';
 import { parseSourceKey } from './sunny-source-identity.mjs';
 import { deferException, readExceptionQueue } from './sunny-exception-store.mjs';
 import { checkpointBatch, closeBatch, readRunStatus } from './sunny-daily-run-state.mjs';
+import { consumeSunnyCandidates } from './run-sunny-candidate-consumer.mjs';
 
 function nyDay(now) { return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date(now)); }
 function gitHead(cwd) { try { return execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return null; } }
@@ -175,6 +176,7 @@ async function executeExactSourceRetries(plan, { dataRoot, now, scan, outcome, c
 export async function runScheduledRetry({
   dataRoot = getCareerOpsRoot(), cwd = process.cwd(), now = new Date(), planner = buildDailyWorkPlan,
   scan = runSerializedScan, outcome = applySourceOutcome, checkpoint = checkpointBatch, close = closeBatch,
+  consumer = consumeSunnyCandidates,
   preflight = async input => retryAfterPreflight(input),
 } = {}) {
   const invokedAt = new Date(now).toISOString();
@@ -189,17 +191,25 @@ export async function runScheduledRetry({
   };
   writeReceipt(receiptPath, receipt);
   try {
-    const result = await planner({ dataRoot, now, runScan: false, retryOnly: true, normalLimit: 20, exceptionLimit: 20 });
+    let result = await planner({ dataRoot, now, runScan: false, retryOnly: true, normalLimit: 20, exceptionLimit: 20 });
+    const executions = [];
+    for (let batch = 0; batch < 10 && result.phase === 'normal'; batch += 1) {
+      const item = await consumer({ plan: result, dataRoot, now }); executions.push(item);
+      if (item.status !== 'completed' || !item.pending_after) break;
+      result = await planner({ dataRoot, now, runScan: false, retryOnly: true, normalLimit: 20, exceptionLimit: 20 });
+    }
+    const execution = executions.at(-1) || { status: 'not_applicable', outcomes: [], pending_after: result.status_counts?.normal_pending };
     const recoveries = await executeExactSourceRetries(result, { dataRoot, now, scan, outcome, checkpoint, close, preflight });
     Object.assign(receipt, {
-      status: 'planned', finished_at: new Date().toISOString(), run_id: result.run_id || null,
+      status: execution.status === 'completed' || recoveries.some(item => ['resolved', 'closed'].includes(item.status)) ? 'completed' : execution.status === 'partial' ? 'partial' : 'planned', finished_at: new Date().toISOString(), run_id: result.run_id || null,
       phase: result.phase || null, batch_id: result.batch?.id || null,
       batch_type: result.batch?.type || null, counts: result.status_counts || result.remaining || null,
       continue_required: Boolean(result.continue_required),
       recoveries,
+      execution: { status: execution.status, outcomes: executions.reduce((total, item) => total + (item.outcomes?.length || 0), 0), pending_after: execution.pending_after, terminal_reference: execution.terminal_reference || null, batches: executions.length },
     });
     writeReceipt(receiptPath, receipt);
-    return { ...result, recoveries, receipt_path: receiptPath, invocation_id: invocationId };
+    return { ...result, execution, recoveries, receipt_path: receiptPath, invocation_id: invocationId };
   } catch (error) {
     Object.assign(receipt, { status: 'failed', finished_at: new Date().toISOString(), error: { name: error?.name || 'Error', message: String(error?.message || error) } });
     writeReceipt(receiptPath, receipt);
